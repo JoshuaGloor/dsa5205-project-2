@@ -1,0 +1,9 @@
+# Ignore all Jupyter notebook files (we track only the Jupytext versions)
+*.ipynb
+
+# Jupyter
+.ipynb_checkpoints/*
+.jupyter_ystore.db
+
+# IDE dot files
+.vscode/*

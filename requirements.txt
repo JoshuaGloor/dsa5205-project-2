@@ -1,0 +1,26 @@
+# Requirements file for DSQF project 2
+
+# Math and data manipulation
+numpy
+pandas
+
+# Data
+yfinance
+
+# ML
+scikit-learn
+arch
+
+# Plots and visual helpers
+matplotlib
+tqdm
+
+# Formatting
+black
+black[jupyter]
+
+# Jupyter related
+jupyter
+ipykernel
+jupytext
+jupyter-collaboration
