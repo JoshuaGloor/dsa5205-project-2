@@ -51,13 +51,16 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import time
+from statsmodels.tsa.api import VAR
 import matplotlib.pyplot as plt
 from pathlib import Path # Added for results directory
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import mean_squared_error
+from arch import arch_model # For GARCH
 import warnings # Added to suppress convergence warnings
+from itertools import product # Needed for ENet grid search
 
 
 # Personal plot configuration
@@ -726,6 +729,11 @@ else:
     print("[INFO] results_store is empty. Nothing to plot.")
 
 # %% [markdown]
+# In evaluating the performance of our daily trading strategies, we utilize specific Buy-and-Hold (BH) benchmarks designed to directly correspond to the strategies' intended holding periods, rather than a simple long-term investment "buy and hold forever" approach. This decision allows for a fairer assessment of the timing value added by the models, instead of comparing it to some investment. 
+#
+# The benchmarks used are: BH NVDA CO (Close-to-Open), which represents the return achieved by passively buying NVDA stock at the market close each day and selling it at the market open the following day, aligning with strategies targeting overnight movements, and BH NVDA CC (Close-to-Close), representing the standard daily return from holding NVDA from one day's close to the next, used for comparing strategies that target full-day returns. By comparing our strategies against these interval-specific benchmarks, we can better isolate whether our models' signals generated alpha beyond simply holding the asset during the targeted trading windows.
+
+# %% [markdown]
 # ### Lasso Models (also could do  Elastic net (Combines Lasso and Ridge) later if needed)
 
 # %%
@@ -735,199 +743,207 @@ ALPHA_GRID_LASSO = np.logspace(-5, -1, 13) # Alpha for Lasso (typically needs sm
 ALPHA_GRID_ENET = np.logspace(-5, -1, 13) # Alpha for ElasticNet
 L1_RATIO_GRID_ENET = [0.1, 0.3, 0.5, 0.7, 0.9, 0.99] # L1 ratio for ElasticNet
 
-
 # %%
-# Generic Walk-Forward Function using a specified model helper (need to test), backtest using time-based rolling windows, row-by-row residualization, and a specified tuning 
-# helper.
-def walk_forward_generic(
-    X_y: pd.DataFrame,
-    tuning_helper_func: callable, # e.g., _best_alpha_by_val_ridge
-    model_name: str,              # e.g., "Lasso"
-    feature_cols=FEATURE_COLS,
-    label_col=LABEL_COL,
-    ctrl_col=CTRL_COL,
-    peers_list=use_peers,
-    train_offset=TRAIN_OFFSET,
-    val_offset=VAL_OFFSET,
-    test_offset=TEST_OFFSET,
-    predict_step=PREDICT_STEP,
-    hyperparam_grid=None, # Passed to helper, format depends on helper
-    cost_one_way=ONE_WAY
-):
-    dates = X_y.index
-    first_train_start = dates.min()
-    first_predict_date = first_train_start + train_offset + val_offset
-    last_date = dates.max()
-    test_period_start_date = last_date - test_offset + pd.Timedelta(days=1)
+# Suppress convergence warnings from Lasso during grid search
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
-    if first_predict_date > last_date: raise ValueError(f"Not enough data for {model_name}.")
+# === Lasso Backtest with Fixed Forward Validation ===
+print("\n" + "="*50)
+print("Executing Lasso Backtest with Fixed Forward Validation")
+print("="*50)
 
-    actual_first_predict_idx = dates.searchsorted(first_predict_date)
-    if actual_first_predict_idx >= len(dates): raise ValueError(f"First prediction date beyond data for {model_name}.")
-    actual_first_predict_date = dates[actual_first_predict_idx]
+# Required variables: X_y, FEATURE_COLS, LABEL_COL, CTRL_COL, use_peers, TRAIN_OFFSET, VAL_OFFSET, TEST_OFFSET, ALPHA_GRID_LASSO, COST_BPS, ONE_WAY,register_results function
 
-    test_start_idx = dates.searchsorted(test_period_start_date)
-    if test_start_idx >= len(dates):
-        print(f"[WARN] {model_name}: Test period start beyond data.")
-        test_start_idx = actual_first_predict_idx
+# --- 1. Define Fixed Time Splits ---
+dates = X_y.index
+first_train_start = dates.min()
+train_end_date = first_train_start + TRAIN_OFFSET - pd.Timedelta(days=1)
+val_end_date = train_end_date + VAL_OFFSET
+test_end_date = val_end_date + TEST_OFFSET # Or use dates.max() if preferred
 
-    print(f"[INFO] {model_name} Backtest | First prediction: {actual_first_predict_date.date()} | Test start: {dates[test_start_idx].date()} | Last date: {last_date.date()}")
+train_df_raw = X_y.loc[first_train_start : train_end_date]
+val_df_raw   = X_y.loc[train_end_date + pd.Timedelta(days=1) : val_end_date]
+test_df_raw  = X_y.loc[val_end_date + pd.Timedelta(days=1) : test_end_date] # Use test_end_date
 
-    records = []
-    prev_sig = 0
+print(f"[INFO] Fixed Splits | Train: {train_df_raw.index.min().date()} to {train_df_raw.index.max().date()} ({len(train_df_raw)} days)")
+print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()} to {val_df_raw.index.max().date()} ({len(val_df_raw)} days)")
+print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()} to {test_df_raw.index.max().date()} ({len(test_df_raw)} days)")
 
-    resid_feature_cols = []
-    if ctrl_col in feature_cols: resid_feature_cols.append(ctrl_col)
-    resid_feature_cols += [p + "_res" for p in peers_list]
+if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+    raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
 
-    current_predict_idx = actual_first_predict_idx
-    while current_predict_idx < len(dates):
-        t = dates[current_predict_idx]
+# --- 2. Calculate Betas ONCE on Training Data ---
+def calculate_betas(train_data_raw, feature_list, ctrl_col_name, peers_list):
+    """Calculates residualization betas based on the raw training data."""
+    betas = {}
+    if ctrl_col_name in train_data_raw.columns:
+        train_features_raw = train_data_raw[feature_list] # Use only feature columns for beta calc
+        for p in peers_list:
+            if p in train_features_raw.columns:
+                df_tr = train_features_raw[[p, ctrl_col_name]].dropna()
+                if len(df_tr) >= 50 and df_tr[ctrl_col_name].std() > 1e-8:
+                    try:
+                        lr = LinearRegression().fit(df_tr[[ctrl_col_name]], df_tr[p])
+                        betas[p] = float(lr.coef_[0])
+                    except Exception as e:
+                        print(f"[WARN] Beta calc failed for {p}: {e}"); betas[p] = np.nan
+                else: betas[p] = np.nan
+            else: betas[p] = np.nan # Peer not in training data
+    else: print(f"[WARN] Control column '{ctrl_col_name}' not in training data.")
+    return betas
 
-        val_end_date = t - pd.Timedelta(days=1)
-        val_start_date = val_end_date - val_offset + pd.Timedelta(days=1)
-        train_end_date = val_start_date - pd.Timedelta(days=1)
-        train_start_date = train_end_date - train_offset + pd.Timedelta(days=1)
-        train_start_date = max(train_start_date, first_train_start)
-        val_start_date = max(val_start_date, first_train_start)
+print("[INFO] Calculating residualization betas on fixed training set...")
+betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+print(f"[INFO] Betas calculated: { {k: f'{v:.4f}' for k, v in betas_fixed.items()} }") # Print formatted betas
 
-        hist_train_raw = X_y.loc[train_start_date : train_end_date]
-        hist_val_raw   = X_y.loc[val_start_date : val_end_date]
-        row_t_raw      = X_y.loc[t]
+# --- 3. Apply Residualization to All Fixed Sets ---
+def apply_resid_slice(df_raw_slice, betas_dict, feature_list, ctrl_col_name, peers_list):
+    """Applies pre-calculated betas to residualize features in a data slice."""
+    df_res = pd.DataFrame(index=df_raw_slice.index)
+    df_features_raw = df_raw_slice[feature_list] # Work with feature columns only
 
-        if hist_train_raw.empty or hist_val_raw.empty:
-            if t >= dates[test_start_idx]: records.append({"date": t, "y_hat": np.nan, "y_real": float(row_t_raw.get(label_col, np.nan)), "hyperparam": np.nan, "signal": 0, "signal_prev": prev_sig, "cost": 0, "pnl": 0})
-            current_predict_idx += 1; continue
+    if ctrl_col_name in df_features_raw.columns:
+         df_res[ctrl_col_name] = df_features_raw[ctrl_col_name]
+         soxx_series = df_features_raw[ctrl_col_name]
+    else:
+         soxx_series = pd.Series(0.0, index=df_features_raw.index)
+         print(f"[WARN] Control '{ctrl_col_name}' missing during apply_resid_slice.")
 
-        train_X_for_resid_t = X_y.loc[train_start_date : val_end_date, feature_cols]
-        xt_res_series = residualize_row(train_X_for_resid_t, row_t_raw[feature_cols], ctrl_col, peers_list)
-
-        Xva_res_list = []
-        for val_idx, val_row in hist_val_raw.iterrows():
-            train_X_for_resid_val = X_y.loc[train_start_date : val_idx - pd.Timedelta(days=1), feature_cols]
-            if not train_X_for_resid_val.empty: res_row = residualize_row(train_X_for_resid_val, val_row[feature_cols], ctrl_col, peers_list); res_row.name = val_idx; Xva_res_list.append(res_row)
-        Xva_res = pd.DataFrame(Xva_res_list) if Xva_res_list else pd.DataFrame(columns=resid_feature_cols)
-
-        Xtr_res_list = []
-        for train_idx, train_row in hist_train_raw.iterrows():
-             train_X_for_resid_train = X_y.loc[train_start_date : train_idx - pd.Timedelta(days=1), feature_cols]
-             if not train_X_for_resid_train.empty: res_row = residualize_row(train_X_for_resid_train, train_row[feature_cols], ctrl_col, peers_list); res_row.name = train_idx; Xtr_res_list.append(res_row)
-        Xtr_res = pd.DataFrame(Xtr_res_list) if Xtr_res_list else pd.DataFrame(columns=resid_feature_cols)
-
-        ytr = hist_train_raw[label_col]; yva = hist_val_raw[label_col]; y_real = float(row_t_raw[label_col])
-
-        # Call the specific tuning helper
-        if "alphas" in tuning_helper_func.__code__.co_varnames:
-            best_hyperparam, final_model = tuning_helper_func(Xtr_res, ytr, Xva_res, yva, alphas=hyperparam_grid)
-        else: # For ENet helper that takes multiple grids
-            best_hyperparam, final_model = tuning_helper_func(Xtr_res, ytr, Xva_res, yva)
-
-
-        if final_model is None:
-            print(f"[WARN] {model_name} model fitting failed for {t.date()}. Skipping.")
-            if t >= dates[test_start_idx]: records.append({"date": t, "y_hat": np.nan, "y_real": y_real, "hyperparam": best_hyperparam, "signal": 0, "signal_prev": prev_sig, "cost": 0, "pnl": 0})
-            current_predict_idx += 1; continue
-
-        model_features = final_model.feature_names_in_
-        xt_res_series_aligned = xt_res_series.reindex(model_features)
-        xt_res_df = pd.DataFrame([xt_res_series_aligned.values], index=[t], columns=model_features)
-
-        if xt_res_df.isnull().any().any(): y_hat = np.nan; sig = 0
+    for p in peers_list:
+        beta_p = betas_dict.get(p, np.nan)
+        if p in df_features_raw.columns and not np.isnan(beta_p):
+            df_res[p + "_res"] = df_features_raw[p] - beta_p * soxx_series
         else:
-             try: y_hat = float(final_model.predict(xt_res_df)[0]); sig = 1 if y_hat > 0 else (-1 if y_hat < 0 else 0)
-             except Exception as e: print(f"[ERROR] {model_name} prediction failed at {t.date()}: {e}"); y_hat = np.nan; sig = 0
+             df_res[p + "_res"] = np.nan
+    return df_res
 
-        if pd.isna(y_real): pnl = np.nan; legs = abs(sig - prev_sig); trade_cost = legs * cost_one_way
-        else: legs = abs(sig - prev_sig); gross_pnl = sig * y_real; trade_cost = legs * cost_one_way; pnl = gross_pnl - trade_cost
+print("[INFO] Applying residualization to Train, Val, Test sets...")
+X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
 
-        if t >= dates[test_start_idx]:
-            records.append({"date": t, "y_hat": y_hat, "y_real": y_real, "hyperparam": best_hyperparam, "signal": sig, "signal_prev": prev_sig, "cost": trade_cost, "pnl": pnl})
+# Define final feature columns based on residualization
+final_feature_cols = []
+if CTRL_COL in FEATURE_COLS: final_feature_cols.append(CTRL_COL)
+final_feature_cols += [p + "_res" for p in use_peers]
+print(f"[INFO] Using residualized features: {final_feature_cols}")
 
-        prev_sig = sig
-        current_predict_idx += 1
+# Align target variables
+y_train = train_df_raw[LABEL_COL]
+y_val   = val_df_raw[LABEL_COL]
+y_test  = test_df_raw[LABEL_COL]
 
-    print(f"[INFO] ...{model_name} Backtest complete.")
-    wf = pd.DataFrame.from_records(records)
-    if not wf.empty: wf = wf.set_index("date").sort_index()
-    return wf
-
-
-# --- Helper function for LASSO hyperparameter tuning ---
-def _best_alpha_by_val_lasso(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID_LASSO):
-    """
-    Trains Lasso for each alpha ON RESIDUALIZED FEATURES, finds lowest MSE on validation,
-    and refits on combined (train + validation) residualized data.
-    """
+# --- 4. Tune Alpha using Fixed Train/Val sets with residualized features, then refit with combined train + validation set---
+def _best_alpha_by_val_lasso_fixed(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID_LASSO):
     best_alpha, best_mse = None, np.inf
     common_features = X_train_res.columns.intersection(X_val_res.columns).tolist()
     if not common_features: return 1e-3, None # Default alpha, no model
 
+    # Prepare training data (drop NaNs from features/target alignment)
+    train_fit_df = X_train_res[common_features].join(y_train).dropna()
+    if train_fit_df.empty: print("[ERROR] Lasso Tuning: Training data empty after NaN drop."); return 1e-3, None
+    Xtr_fit = train_fit_df[common_features]
+    ytr_fit = train_fit_df[LABEL_COL]
+
+    # Prepare validation data similarly
+    val_pred_df = X_val_res[common_features].join(y_val).dropna()
+    if val_pred_df.empty: print("[WARN] Lasso Tuning: Validation data empty after NaN drop."); # Continue tuning, but result might be less reliable
+    Xva_pred = val_pred_df[common_features]
+    yva_eval = val_pred_df[LABEL_COL]
+
     for a in alphas:
-        # Increase max_iter for Lasso convergence
         pipe = Pipeline([
             ("scaler", StandardScaler(with_mean=True, with_std=True)),
             ("lasso",  Lasso(alpha=a, random_state=42, max_iter=2000))
         ])
-        train_fit_df = X_train_res[common_features].join(y_train).dropna();
-        if train_fit_df.empty: continue
-        Xtr_fit, ytr_fit = train_fit_df[common_features], train_fit_df[y_train.name]
-        if Xtr_fit.empty: continue
-        try: pipe.fit(Xtr_fit, ytr_fit)
+        try:
+            pipe.fit(Xtr_fit, ytr_fit)
+            if not Xva_pred.empty: # Only calculate MSE if validation data exists
+                 y_pred_val = pipe.predict(Xva_pred)
+                 mse = mean_squared_error(yva_eval, y_pred_val)
+                 if mse < best_mse: best_mse, best_alpha = mse, a
+            else: # If val data is empty, just keep track of alpha, maybe pick last one? Or default.
+                 best_alpha = a # Keep track of the last tested alpha if no validation comparison possible
         except ValueError as e: print(f"[WARN] Lasso pipe fitting failed for alpha {a}: {e}"); continue
-
-        Xva_pred_ready = X_val_res[common_features].dropna()
-        if Xva_pred_ready.empty: mse = np.inf
-        else:
-             yva_aligned = y_val.loc[Xva_pred_ready.index].dropna()
-             valid_idx = Xva_pred_ready.index.intersection(yva_aligned.index)
-             if valid_idx.empty: mse = np.inf
-             else:
-                  Xva_pred_final = Xva_pred_ready.loc[valid_idx]; yva_aligned_final = yva_aligned.loc[valid_idx]
-                  if Xva_pred_final.empty: mse = np.inf
-                  else: y_pred_val = pipe.predict(Xva_pred_final); mse = mean_squared_error(yva_aligned_final, y_pred_val)
-        if mse < best_mse: best_mse, best_alpha = mse, a
 
     if best_alpha is None: best_alpha = 1e-3; print("[WARN] No best alpha found for Lasso. Defaulting.")
 
-    X_tv_res = pd.concat([X_train_res, X_val_res], axis=0)[common_features]; y_tv = pd.concat([y_train, y_val], axis=0)
+    # Refit on combined Train + Val
+    X_tv_res = pd.concat([X_train_res, X_val_res], axis=0)[common_features]
+    y_tv = pd.concat([y_train, y_val], axis=0)
     final_pipe = Pipeline([("scaler", StandardScaler(with_mean=True, with_std=True)), ("lasso", Lasso(alpha=best_alpha, random_state=42, max_iter=2000))])
     final_fit_df = X_tv_res.join(y_tv).dropna()
     if final_fit_df.empty: print("[ERROR] Lasso final fit data empty."); return best_alpha, None
-    try: final_pipe.fit(final_fit_df[common_features], final_fit_df[y_tv.name])
+    try:
+        final_pipe.fit(final_fit_df[common_features], final_fit_df[LABEL_COL])
     except ValueError as e: print(f"[ERROR] Lasso final pipe fitting failed: {e}"); return best_alpha, None
     return best_alpha, final_pipe
 
+print("\n[INFO] Tuning Lasso alpha using fixed validation set...")
+best_alpha_lasso, final_model_lasso = _best_alpha_by_val_lasso_fixed(X_train_res, y_train, X_val_res, y_val)
 
-# --- Execute Lasso Backtest ---
-print("\n" + "="*50); print("Executing Lasso Backtest"); print("="*50)
-wf_lasso_time_res = walk_forward_generic(
-    X_y,
-    _best_alpha_by_val_lasso,           # Lasso-specific tuning helper
-    "Lasso",                            # Model name for logging/registration
-    hyperparam_grid=ALPHA_GRID_LASSO    # Pass the Lasso alpha grid
-)
-
-# Register the results (saves DF to results_store dict and to a CSV file)
-# The results_store dictionary should already exist from a previous cell.
-register_results("Lasso_TimeRoll_ResidRow", wf_lasso_time_res)
-
-# Optional: Print head of Lasso results DataFrame
-if wf_lasso_time_res is not None and not wf_lasso_time_res.empty:
-    print("\n[INFO] wf_lasso_time_res (head of results):")
-    print(wf_lasso_time_res.head())
+if final_model_lasso is None:
+    print("[ERROR] Final Lasso model could not be trained. Skipping testing.")
+    wf_lasso_fixed_res = pd.DataFrame() # Create empty DF
 else:
-    print("[INFO] No results generated for Lasso.")
+    print(f"[INFO] Best Lasso Alpha: {best_alpha_lasso:.5f}")
+    # --- 5. Test Final Model ---
+    print("[INFO] Evaluating final Lasso model on fixed test set...")
+    X_test_pred = X_test_res[final_model_lasso.feature_names_in_].dropna() # Use features model was trained on, drop rows with NaNs in features
+    test_records = []
+    prev_sig = 0 # Initialize prev_sig for the fixed test period
+
+    if X_test_pred.empty:
+         print("[WARN] No valid data points in the test set after dropping NaNs.")
+    else:
+        # Predict on the valid test features
+        y_hat_test_array = final_model_lasso.predict(X_test_pred)
+        y_hat_test = pd.Series(y_hat_test_array, index=X_test_pred.index)
+
+        # Align predictions with actuals and calculate PnL
+        test_results_df = pd.DataFrame({'y_hat': y_hat_test}).join(y_test.rename('y_real')).dropna() # Ensure alignment and drop rows where y_real might be missing
+
+        if test_results_df.empty:
+             print("[WARN] No common dates between test predictions and actuals.")
+        else:
+            test_results_df['signal'] = np.where(test_results_df['y_hat'] > 0, 1, np.where(test_results_df['y_hat'] < 0, -1, 0))
+            # Calculate signal_prev correctly for the fixed test block
+            test_results_df['signal_prev'] = test_results_df['signal'].shift(1).fillna(0) # Start flat on day 1 of test
+            test_results_df['delta_pos'] = (test_results_df['signal'] - test_results_df['signal_prev']).abs()
+            test_results_df['cost'] = test_results_df['delta_pos'] * ONE_WAY
+            test_results_df['pnl'] = test_results_df['signal'] * test_results_df['y_real'] - test_results_df['cost']
+            # Add hyperparam column for consistency with generic output (though it's fixed here)
+            test_results_df['hyperparam'] = best_alpha_lasso
+
+    # Store results even if empty for consistent handling later
+    wf_lasso_fixed_res = test_results_df.copy() if 'test_results_df' in locals() and not test_results_df.empty else pd.DataFrame()
+
+# --- 6. Register Results ---
+register_results("Lasso_FixedFWD_Resid", wf_lasso_fixed_res)
+
+# Print head of results
+if not wf_lasso_fixed_res.empty:
+    print("\n[INFO] wf_lasso_fixed_res (head of test results):")
+    print(wf_lasso_fixed_res.head())
+else:
+    print("[INFO] No results generated for Lasso Fixed FWD.")
 print("="*50)
 
+
 # %%
-# ## Step 6: Evaluation
+# --- Imports needed for plotting (if not already done) ---
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Step 6: Evaluation (Using the results registry functions), and plotting results
 
 # Summarize results from the store
 print("\n" + "="*40)
 print("PERFORMANCE SUMMARY (All Models)")
 print("="*40)
-# Ensure results_store is passed to the function
-results_summary = summarize_results(results_store) # results_store should exist from previous steps
+# Assuming summarize_results function is defined in a previous cell
+# It should already handle saving the summary to CSV.
+results_summary = summarize_results(results_store)
 if results_summary is not None and not results_summary.empty:
     print("\nSummary Statistics Table:")
     # Display more precision in the summary table
@@ -936,7 +952,6 @@ if results_summary is not None and not results_summary.empty:
 else:
      print("No model results available to summarize.")
 print("="*40)
-
 
 # --- Plotting Results ---
 # Plot only models present in the results_store
@@ -947,9 +962,8 @@ if results_store:
     # Plot strategy cumulative returns
     for name, df in results_store.items():
         if df is not None and not df.empty and 'pnl' in df.columns:
-            # Add cumulative PnL column if it doesn't exist
+            # Add cumulative PnL column if needed
             if 'cum_pnl' not in df.columns:
-                 # Ensure pnl is numeric, fillna for calculation
                  df['cum_pnl'] = (1 + df['pnl'].fillna(0)).cumprod() - 1
 
             # Ensure data is available for plotting
@@ -966,7 +980,6 @@ if results_store:
     for name, df in results_store.items():
         if df is not None and not df.empty and 'y_real' in df.columns:
             bh_df_source = df.copy() # Use this df's index and y_real
-            # Ensure y_real is numeric, fillna for calculation
             bh_df_source[bh_col_name] = (1 + bh_df_source['y_real'].fillna(0)).cumprod() - 1
             break # Use the first valid one
 
@@ -978,7 +991,6 @@ if results_store:
 
     if plot_count > 0:
         # Determine overall date range for title
-        # Correctly find min/max dates across all valid DataFrame indices
         all_min_dates = [df.index.min() for df in results_store.values() if df is not None and not df.empty]
         all_max_dates = [df.index.max() for df in results_store.values() if df is not None and not df.empty]
 
@@ -995,312 +1007,1195 @@ if results_store:
         plt.grid(True)
         # Save the plot
         try:
-             plt.savefig(RESULTS_DIR / "cumulative_pnl_comparison.png")
-             print(f"[INFO] Cumulative PnL plot saved to {RESULTS_DIR / 'cumulative_pnl_comparison.png'}")
+             plt.savefig(RESULTS_DIR / "cumulative_pnl_comparison_lasso.png") # Changed filename slightly
+             print(f"[INFO] Cumulative PnL plot saved to {RESULTS_DIR / 'cumulative_pnl_comparison_lasso.png'}")
         except Exception as e:
              print(f"[ERROR] Failed to save cumulative PnL plot: {e}")
         plt.show() # Display the plot
     else:
         print("[INFO] No valid model results found to plot.")
 
-    # --- Plot alpha chosen over time for the LASSO model run ---
-    lasso_model_key = "Lasso_TimeRoll_ResidRow" # Key used when registering Lasso results
+    # --- Plot alpha chosen over time for the LASSO model run (Fixed FWD) ---
+    lasso_model_key = "Lasso_FixedFWD_Resid" # Key used in register_results
     if lasso_model_key in results_store:
          lasso_df = results_store[lasso_model_key]
-         # Check if the hyperparameter column exists and is not all NaN
-         # The generic function saves the best alpha under 'hyperparam'
-         param_col_lasso = 'hyperparam'
-         if param_col_lasso in lasso_df.columns and not lasso_df[param_col_lasso].isna().all():
+         # Note: For fixed validation, 'hyperparam' column will have the SAME best alpha for all test rows.
+         # Plotting it still confirms the alpha chosen.
+         if 'hyperparam' in lasso_df.columns and not lasso_df['hyperparam'].isna().all():
               plt.figure(figsize=(14, 5))
-              plt.plot(lasso_df.index, lasso_df[param_col_lasso], marker='.', linestyle='None', label='Chosen Alpha')
+              # Use scatter plot as value is constant for fixed validation test period
+              plt.scatter(lasso_df.index, lasso_df['hyperparam'], marker='.', label=f'Chosen Alpha ({lasso_df["hyperparam"].iloc[0]:.5f})')
               plt.yscale('log') # Use log scale for alpha
-              plt.title("Lasso Alpha Chosen Over Time (Log Scale)") # Specific title for Lasso
-              plt.xlabel("Date")
+              plt.title(f"Lasso Alpha Chosen During Fixed Validation (Test Period View, Log Scale)")
+              plt.xlabel("Date (Test Period)")
               plt.ylabel("Alpha (log scale)")
+              # Set y-limits to better view the constant alpha if needed, adjust padding
+              min_alpha = lasso_df['hyperparam'].min()
+              max_alpha = lasso_df['hyperparam'].max()
+              if min_alpha == max_alpha and min_alpha > 0:
+                   plt.ylim(min_alpha * 0.5, max_alpha * 2) # Example padding for log scale
+              plt.legend()
               plt.grid(True)
               # Save the plot
               try:
-                   plot_filename_lasso = f"{lasso_model_key}_hyperparams_over_time.png"
-                   plt.savefig(RESULTS_DIR / plot_filename_lasso)
-                   print(f"[INFO] Lasso hyperparameter plot saved to {RESULTS_DIR / plot_filename_lasso}")
+                   plot_filename = f"{lasso_model_key}_hyperparam_test_period.png"
+                   plt.savefig(RESULTS_DIR / plot_filename)
+                   print(f"[INFO] Lasso hyperparameter plot saved to {RESULTS_DIR / plot_filename}")
               except Exception as e:
                    print(f"[ERROR] Failed to save hyperparameter plot for {lasso_model_key}: {e}")
               plt.show() # Display the plot
          else:
-              print(f"[INFO] Hyperparameter column ('{param_col_lasso}') not available or empty for {lasso_model_key}.")
+              print(f"[INFO] Hyperparameter column ('hyperparam') not available or empty for {lasso_model_key}.")
     else:
-        print(f"[INFO] Results for {lasso_model_key} not found in results_store. Cannot plot hyperparameters.")
+         print(f"[INFO] Results for {lasso_model_key} not found in results_store.")
 
 else:
     print("[INFO] results_store is empty. Nothing to plot.")
 
 # %% [markdown]
+# ### Elastic Net
+
+# %%
+# --- Ensure Config Variables Exist (Assume defined in previous cells) ---
+# Required: X_y, FEATURE_COLS, LABEL_COL, CTRL_COL, use_peers, TRAIN_OFFSET, VAL_OFFSET, TEST_OFFSET, ALPHA_GRID_ENET, L1_RATIO_GRID_ENET, COST_BPS, ONE_WAY,
+#           calculate_betas, apply_resid_slice, register_results functions
+
+# --- 1. Check if splits exist from a previous block (e.g., Lasso block), otherwise create ---
+if 'train_df_raw' not in locals() or 'val_df_raw' not in locals() or 'test_df_raw' not in locals():
+     print("[INFO] Redefining fixed time splits for Elastic Net...")
+     dates = X_y.index
+     first_train_start = dates.min()
+     train_end_date = first_train_start + TRAIN_OFFSET - pd.Timedelta(days=1)
+     val_end_date = train_end_date + VAL_OFFSET
+     test_end_date = val_end_date + TEST_OFFSET # Or use dates.max()
+
+     train_df_raw = X_y.loc[first_train_start : train_end_date]
+     val_df_raw   = X_y.loc[train_end_date + pd.Timedelta(days=1) : val_end_date]
+     test_df_raw  = X_y.loc[val_end_date + pd.Timedelta(days=1) : test_end_date]
+
+     print(f"[INFO] Fixed Splits | Train: {train_df_raw.index.min().date()} to {train_df_raw.index.max().date()} ({len(train_df_raw)} days)")
+     print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()} to {val_df_raw.index.max().date()} ({len(val_df_raw)} days)")
+     print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()} to {test_df_raw.index.max().date()} ({len(test_df_raw)} days)")
+
+     if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+         raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
+else:
+     print("[INFO] Using existing fixed time splits.")
+
+# --- 2. Check/Recalculate Betas on Training Data ---
+if 'betas_fixed' not in locals():
+    print("[INFO] Calculating residualization betas on fixed training set for Elastic Net...")
+    # Ensure calculate_betas function is defined in a previous cell
+    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+    print(f"[INFO] Betas calculated: { {k: f'{v:.4f}' for k, v in betas_fixed.items()} }")
+else:
+    print("[INFO] Using existing fixed betas.")
+
+# --- 3. Check/Apply Residualization to All Fixed Sets ---
+if ('X_train_res' not in locals() or 'X_val_res' not in locals() or 'X_test_res' not in locals() or
+    'final_feature_cols' not in locals() or 'y_train' not in locals() or 'y_val' not in locals() or 'y_test' not in locals()):
+    print("[INFO] Applying residualization to Train, Val, Test sets for Elastic Net...")
+    # Ensure apply_resid_slice function is defined in a previous cell
+    X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+    X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+    X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+
+    # Define final feature columns based on residualization
+    final_feature_cols = []
+    if CTRL_COL in FEATURE_COLS: final_feature_cols.append(CTRL_COL)
+    final_feature_cols += [p + "_res" for p in use_peers]
+    print(f"[INFO] Using residualized features: {final_feature_cols}")
+
+    # Align target variables
+    y_train = train_df_raw[LABEL_COL]
+    y_val   = val_df_raw[LABEL_COL]
+    y_test  = test_df_raw[LABEL_COL]
+else:
+    print("[INFO] Using existing residualized Train, Val, Test sets and features.")
+
+
+# --- 4. Tune Alpha and L1 Ratio (elastic net) using Fixed Train/Val sets (Residualized features) ---
+def _best_params_by_val_enet_fixed(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID_ENET, l1_ratios=L1_RATIO_GRID_ENET):
+    best_alpha, best_l1, best_mse = None, None, np.inf
+    common_features = X_train_res.columns.intersection(X_val_res.columns).tolist()
+    if not common_features: return (1e-3, 0.5), None # Default params, no model
+
+    # Prepare training data
+    train_fit_df = X_train_res[common_features].join(y_train).dropna()
+    if train_fit_df.empty: print("[ERROR] ENet Tuning: Training data empty after NaN drop."); return (1e-3, 0.5), None
+    Xtr_fit = train_fit_df[common_features]
+    ytr_fit = train_fit_df[LABEL_COL]
+
+    # Prepare validation data
+    val_pred_df = X_val_res[common_features].join(y_val).dropna()
+    if val_pred_df.empty: print("[WARN] ENet Tuning: Validation data empty after NaN drop.")
+    Xva_pred = val_pred_df[common_features]
+    yva_eval = val_pred_df[LABEL_COL]
+
+    for a, l1 in product(alphas, l1_ratios):
+        pipe = Pipeline([
+            ("scaler", StandardScaler(with_mean=True, with_std=True)),
+            ("enet",   ElasticNet(alpha=a, l1_ratio=l1, random_state=42, max_iter=2000)) # Reduced max_iter slightly
+        ])
+        try:
+            pipe.fit(Xtr_fit, ytr_fit)
+            if not Xva_pred.empty:
+                 y_pred_val = pipe.predict(Xva_pred)
+                 mse = mean_squared_error(yva_eval, y_pred_val)
+                 if mse < best_mse: best_mse, best_alpha, best_l1 = mse, a, l1
+            else:
+                 best_alpha, best_l1 = a, l1 # Keep track if no validation comparison possible
+        except ValueError as e: print(f"[WARN] ENet pipe fitting failed for alpha {a}, l1 {l1}: {e}"); continue
+
+    if best_alpha is None: best_alpha, best_l1 = 1e-3, 0.5; print("[WARN] No best params found for ENet. Defaulting.")
+
+    # Refit on combined Train + Val
+    X_tv_res = pd.concat([X_train_res, X_val_res], axis=0)[common_features]
+    y_tv = pd.concat([y_train, y_val], axis=0)
+    final_pipe = Pipeline([("scaler", StandardScaler(with_mean=True, with_std=True)), ("enet", ElasticNet(alpha=best_alpha, l1_ratio=best_l1, random_state=42, max_iter=2000))])
+    final_fit_df = X_tv_res.join(y_tv).dropna()
+    if final_fit_df.empty: print("[ERROR] ENet final fit data empty."); return (best_alpha, best_l1), None
+    try:
+        final_pipe.fit(final_fit_df[common_features], final_fit_df[LABEL_COL])
+    except ValueError as e: print(f"[ERROR] ENet final pipe fitting failed: {e}"); return (best_alpha, best_l1), None
+
+    return (best_alpha, best_l1), final_pipe
+
+print("\n[INFO] Tuning Elastic Net params using fixed validation set...")
+best_params_enet, final_model_enet = _best_params_by_val_enet_fixed(X_train_res, y_train, X_val_res, y_val)
+
+if final_model_enet is None:
+    print("[ERROR] Final Elastic Net model could not be trained. Skipping testing.")
+    wf_enet_fixed_res = pd.DataFrame() # Create empty DF
+else:
+    best_alpha_enet, best_l1_enet = best_params_enet
+    print(f"[INFO] Best ENet Alpha: {best_alpha_enet:.5f}, Best L1 Ratio: {best_l1_enet:.2f}")
+    # --- 5. Test Final Model ---
+    print("[INFO] Evaluating final Elastic Net model on fixed test set...")
+    X_test_pred = X_test_res[final_model_enet.feature_names_in_].dropna()
+    test_results_df = pd.DataFrame() # Initialize empty
+
+    if X_test_pred.empty:
+         print("[WARN] No valid data points in the test set after dropping NaNs.")
+    else:
+        y_hat_test_array = final_model_enet.predict(X_test_pred)
+        y_hat_test = pd.Series(y_hat_test_array, index=X_test_pred.index)
+        test_results_df = pd.DataFrame({'y_hat': y_hat_test}).join(y_test.rename('y_real')).dropna()
+
+        if test_results_df.empty:
+             print("[WARN] No common dates between test predictions and actuals.")
+        else:
+            test_results_df['signal'] = np.where(test_results_df['y_hat'] > 0, 1, np.where(test_results_df['y_hat'] < 0, -1, 0))
+            test_results_df['signal_prev'] = test_results_df['signal'].shift(1).fillna(0)
+            test_results_df['delta_pos'] = (test_results_df['signal'] - test_results_df['signal_prev']).abs()
+            test_results_df['cost'] = test_results_df['delta_pos'] * ONE_WAY
+            test_results_df['pnl'] = test_results_df['signal'] * test_results_df['y_real'] - test_results_df['cost']
+            # Add hyperparam column (store as tuple)
+            test_results_df['hyperparam'] = [best_params_enet] * len(test_results_df)
+
+    wf_enet_fixed_res = test_results_df.copy()
+
+# --- 6. Register Results ---
+register_results("ENet_FixedFWD_Resid", wf_enet_fixed_res)
+
+# Print head of results
+if not wf_enet_fixed_res.empty:
+    print("\n[INFO] wf_enet_fixed_res (head of test results):")
+    print(wf_enet_fixed_res.head())
+else:
+    print("[INFO] No results generated for Elastic Net Fixed FWD.")
+print("="*50)
+
+
+# %%
+# Summarize results from the store
+print("\n" + "="*40)
+print("PERFORMANCE SUMMARY (All Models)")
+print("="*40)
+# Assuming summarize_results function is defined in a previous cell
+# It should already handle saving the summary to CSV.
+results_summary = summarize_results(results_store)
+if results_summary is not None and not results_summary.empty:
+    print("\nSummary Statistics Table:")
+    # Display more precision in the summary table
+    with pd.option_context('display.float_format', '{:,.4f}'.format):
+        print(results_summary)
+else:
+     print("No model results available to summarize.")
+print("="*40)
+
+# --- Plotting Results ---
+# Plot only models present in the results_store
+if results_store:
+    plt.figure(figsize=(14, 8))
+    plot_count = 0
+
+    # Plot strategy cumulative returns
+    for name, df in results_store.items():
+        if df is not None and not df.empty and 'pnl' in df.columns:
+            # Add cumulative PnL column if needed
+            if 'cum_pnl' not in df.columns:
+                 df['cum_pnl'] = (1 + df['pnl'].fillna(0)).cumprod() - 1
+
+            # Ensure data is available for plotting
+            if not df['cum_pnl'].isna().all():
+                 plt.plot(df.index, df['cum_pnl'], label=f"{name} (Net)")
+                 plot_count += 1
+            else:
+                 print(f"[INFO] Skipping plot for {name} - cumulative PnL is all NaN.")
+
+    # Add Buy & Hold NVDA Close-to-Open benchmark from a representative run
+    bh_df_source = None
+    bh_col_name = 'cum_bh'
+    # Find a valid results df to source the benchmark y_real
+    for name, df in results_store.items():
+        if df is not None and not df.empty and 'y_real' in df.columns:
+            bh_df_source = df.copy() # Use this df's index and y_real
+            bh_df_source[bh_col_name] = (1 + bh_df_source['y_real'].fillna(0)).cumprod() - 1
+            break # Use the first valid one
+
+    if bh_df_source is not None and not bh_df_source[bh_col_name].isna().all():
+         plt.plot(bh_df_source.index, bh_df_source[bh_col_name], label='BH NVDA CO', linestyle='--', color='black')
+         plot_count += 1
+    else:
+         print("[WARN] Could not plot Buy & Hold NVDA (CO) benchmark.")
+
+    if plot_count > 0:
+        # Determine overall date range for title
+        all_min_dates = [df.index.min() for df in results_store.values() if df is not None and not df.empty]
+        all_max_dates = [df.index.max() for df in results_store.values() if df is not None and not df.empty]
+
+        if all_min_dates and all_max_dates:
+             min_date_str = min(all_min_dates).date()
+             max_date_str = max(all_max_dates).date()
+             plt.title(f"Cumulative PnL Comparison (Test Periods ending {max_date_str})")
+        else:
+             plt.title("Cumulative PnL Comparison")
+
+        plt.xlabel("Date")
+        plt.ylabel("Cumulative Return")
+        plt.legend()
+        plt.grid(True)
+        # Save the plot
+        try:
+             # Make filename more general if plotting multiple models
+             plot_filename_cum = "cumulative_pnl_comparison_all.png"
+             plt.savefig(RESULTS_DIR / plot_filename_cum)
+             print(f"[INFO] Cumulative PnL plot saved to {RESULTS_DIR / plot_filename_cum}")
+        except Exception as e:
+             print(f"[ERROR] Failed to save cumulative PnL plot: {e}")
+        plt.show() # Display the plot
+    else:
+        print("[INFO] No valid model results found to plot.")
+
+    # --- Plot alpha and l1_ratio chosen over time for the ELASTIC NET model run (Fixed FWD) ---
+    enet_model_key = "ENet_FixedFWD_Resid" # Key used in register_results
+    if enet_model_key in results_store:
+         enet_df = results_store[enet_model_key]
+         # Note: For fixed validation, 'hyperparam' column will have the SAME best (alpha, l1_ratio) tuple for all test rows.
+         if 'hyperparam' in enet_df.columns and not enet_df['hyperparam'].isna().all():
+              plt.figure(figsize=(14, 5))
+
+              # Extract the chosen alpha and l1_ratio (they are constant in this case)
+              chosen_params = enet_df['hyperparam'].iloc[0] # Get the tuple
+              chosen_alpha = chosen_params[0]
+              chosen_l1 = chosen_params[1]
+
+              # Use scatter plot as values are constant for fixed validation test period
+              # Plot alpha
+              plt.scatter(enet_df.index, enet_df['hyperparam'].apply(lambda x: x[0]),
+                          marker='.', label=f'Chosen Alpha ({chosen_alpha:.5f})')
+              # Plot l1_ratio on the same plot or a secondary axis if scales differ significantly
+              # For simplicity, plotting on the same axis first (adjust if needed)
+              plt.scatter(enet_df.index, enet_df['hyperparam'].apply(lambda x: x[1]),
+                          marker='x', label=f'Chosen L1 Ratio ({chosen_l1:.2f})')
+
+              plt.yscale('log') # Use log scale, mainly relevant for alpha
+              plt.title(f"Elastic Net Params Chosen During Fixed Validation (Test Period View, Alpha Log Scale)")
+              plt.xlabel("Date (Test Period)")
+              plt.ylabel("Hyperparameter Value (Alpha Log)")
+
+              # Adjust y-limits if needed for clarity
+              min_val = min(chosen_alpha * 0.5, chosen_l1 * 0.5) if chosen_alpha > 0 and chosen_l1 > 0 else 0.00001
+              max_val = max(chosen_alpha * 2, chosen_l1 * 2) if chosen_alpha > 0 and chosen_l1 > 0 else 10
+              plt.ylim(min_val, max_val)
+
+              plt.legend()
+              plt.grid(True)
+              # Save the plot
+              try:
+                   plot_filename = f"{enet_model_key}_hyperparams_test_period.png"
+                   plt.savefig(RESULTS_DIR / plot_filename)
+                   print(f"[INFO] Elastic Net hyperparameter plot saved to {RESULTS_DIR / plot_filename}")
+              except Exception as e:
+                   print(f"[ERROR] Failed to save hyperparameter plot for {enet_model_key}: {e}")
+              plt.show() # Display the plot
+         else:
+              print(f"[INFO] Hyperparameter column ('hyperparam') not available or empty for {enet_model_key}.")
+    else:
+         print(f"[INFO] Results for {enet_model_key} not found in results_store.")
+
+else:
+    print("[INFO] results_store is empty. Nothing to plot.")
+
+
+# %% [markdown]
 # ### Model 2: VAR(1) and VAR(10) Time Series Model
 
 # %%
-# ========= VAR(p) on close->close returns (trade close->close) =========
-# Uses statsmodels VAR; walk-forward expanding window; p in {1, 10}
-import pandas as pd
-import numpy as np
-from statsmodels.tsa.api import VAR
+# --- Ensure Config Variables and Data Exist ---
+# Required: ret_cc DataFrame (close-to-close returns), TRAIN_OFFSET, VAL_OFFSET, TEST_OFFSET, COST_BPS, ONE_WAY, register_results, ann_stats functions
 
-# 1) Build a compact vector (keep it small/interpretable)
-var_cols = [c for c in ["NVDA","SOXX","AMD","MSFT","TSM"] if c in ret_cc.columns]
-df_var = ret_cc[var_cols].dropna().copy()
+# --- Define VAR Columns and Prepare Data ---
+VAR_TARGET = "NVDA"
+var_cols = ret_cc.columns.tolist()
+if VAR_TARGET not in var_cols:
+     raise ValueError(f"Target {VAR_TARGET} not found in ret_cc columns for VAR.")
+print(f"[INFO] Using ALL {len(var_cols)} features from ret_cc for VAR.")
+df_var_full = ret_cc[var_cols].dropna(how='all').copy() # Use all columns, drop rows that are all NaN
 
-def walk_forward_var(df, target="NVDA", p=1, min_train=250, cost_bps=5):
-    dates = df.index
-    recs = []
-    one_way = cost_bps/10000.0
-    pos_prev = 0
-    for i in range(min_train, len(dates)-1):
-        train = df.iloc[:i]           # up to t-1
-        fit = VAR(train.values).fit(maxlags=p, ic=None, trend='c')
-        # Forecast t (one step ahead): predict close->close return at t for all variables
-        fc  = fit.forecast(train.values[-p:], steps=1)
-        y_hat = float(fc[0, list(df.columns).index(target)])
-        y_real = float(df.iloc[i][target])             # realized close->close at t
+# --- 1. Define Fixed Time Splits for VAR Data ---
+dates_var = df_var_full.index
+first_train_start_var = dates_var.min()
+train_end_date_var = first_train_start_var + TRAIN_OFFSET - pd.Timedelta(days=1)
+val_end_date_var = train_end_date_var + VAL_OFFSET
+test_end_date_var = val_end_date_var + TEST_OFFSET # Or use dates_var.max()
 
-        # Signal: sign(y_hat) with shorting
-        sig = 1 if y_hat > 0 else (-1 if y_hat < 0 else 0)
-        # Costs on position change
-        legs = abs(sig - pos_prev)          # 0,1,2
-        cost = legs * one_way
-        pnl  = sig * y_real - cost          # trade close->close
-        recs.append({"date": dates[i], "y_hat": y_hat, "y_real": y_real, "signal": sig,
-                     "signal_prev": pos_prev, "cost": cost, "pnl": pnl})
-        pos_prev = sig
+train_df_var = df_var_full.loc[first_train_start_var : train_end_date_var]
+val_df_var   = df_var_full.loc[train_end_date_var + pd.Timedelta(days=1) : val_end_date_var]
+test_df_var  = df_var_full.loc[val_end_date_var + pd.Timedelta(days=1) : test_end_date_var]
 
-    out = pd.DataFrame(recs).set_index("date")
-    return out
+# Drop rows with ANY NaNs within each split, as VAR cannot handle missing values
+train_df_var = train_df_var.dropna()
+val_df_var = val_df_var.dropna()
+test_df_var = test_df_var.dropna()
 
-wf_var1  = walk_forward_var(df_var, target="NVDA", p=1,  min_train=250, cost_bps=5)
-wf_var10 = walk_forward_var(df_var, target="NVDA", p=10, min_train=250, cost_bps=5)
+print(f"[INFO] VAR Fixed Splits (after dropna) | Train: {train_df_var.index.min().date()} to {train_df_var.index.max().date()} ({len(train_df_var)} days)")
+print(f"[INFO] VAR Fixed Splits (after dropna) | Val  : {val_df_var.index.min().date()} to {val_df_var.index.max().date()} ({len(val_df_var)} days)")
+print(f"[INFO] VAR Fixed Splits (after dropna) | Test : {test_df_var.index.min().date()} to {test_df_var.index.max().date()} ({len(test_df_var)} days)")
 
-# Quick eval helper
-def ann_stats(r, ppyr=252):
-    r = r.dropna()
-    mu  = r.mean()*ppyr
-    vol = r.std(ddof=1)*np.sqrt(ppyr)
-    shp = mu/vol if vol>0 else np.nan
-    return mu, vol, shp
+if train_df_var.empty or val_df_var.empty or test_df_var.empty:
+    raise ValueError("One or more fixed data splits are empty for VAR after dropna. Check data quality.")
 
-for name, wf in [("VAR(1) C->C", wf_var1), ("VAR(10) C->C", wf_var10)]:
-    mu, vol, shp = ann_stats(wf["pnl"])
-    mu_bh, vol_bh, shp_bh = ann_stats(wf["y_real"])  # buy & hold close->close
-    print(f"[{name}]  net ann_ret={mu:.4f} ann_vol={vol:.4f} Sharpe={shp:.2f}  |  BH C->C Sharpe={shp_bh:.2f}")
+# --- 2. Tune VAR Lag 'p' using Fixed Train/Val ---
+lag_grid = [1, 10] # Lags to test
+validation_results_var = {}
 
+target_col_idx = list(train_df_var.columns).index(VAR_TARGET)
+
+print("\n[INFO] Tuning VAR lag 'p' using fixed validation set...")
+for p in lag_grid:
+    print(f"  Testing p={p}...")
+    try:
+        # Fit VAR(p) on the training set
+        model_var_train = VAR(train_df_var.values)
+        fit_var_train = model_var_train.fit(maxlags=p, ic=None, trend='c')
+        # Assign names from the actual training columns
+        fit_var_train.names = train_df_var.columns # Add names for forecast indexing
+
+        # Generate rolling 1-step ahead forecasts for the validation period
+        history = train_df_var.values[-(fit_var_train.k_ar):]
+        val_predictions = []
+
+        for i in range(len(val_df_var)):
+            forecast = fit_var_train.forecast(history, steps=1)
+            val_predictions.append(forecast[0, target_col_idx])
+            actual_obs = val_df_var.values[i:i+1]
+            history = np.vstack([history[1:], actual_obs])
+
+        y_hat_val = pd.Series(val_predictions, index=val_df_var.index)
+        y_real_val = val_df_var[VAR_TARGET]
+
+        mse_val = mean_squared_error(y_real_val.loc[y_hat_val.index], y_hat_val)
+        validation_results_var[p] = mse_val
+        print(f"    p={p}: Validation MSE = {mse_val:.6f}")
+
+    except Exception as e:
+        print(f"[WARN] VAR fitting/forecasting failed for p={p}: {e}")
+        validation_results_var[p] = np.inf
+
+# --- 3. Select Best Lag 'p' ---
+if not validation_results_var or all(np.isinf(v) for v in validation_results_var.values()):
+    best_p = 1
+    print("\n[WARN] VAR tuning failed. Defaulting to p=1.")
+else:
+    best_p = min(validation_results_var, key=validation_results_var.get)
+    print(f"\n[INFO] Best VAR Lag selected: p={best_p} (Validation MSE: {validation_results_var[best_p]:.6f})")
+
+# --- 4. Refit Final Model on Train+Val ---
+print(f"\n[INFO] Retraining final VAR model with p={best_p} on Train+Validation data...")
+train_val_df_var = pd.concat([train_df_var, val_df_var])
+# *** Ensure no NaNs in combined data for refitting ***
+train_val_df_var = train_val_df_var.dropna()
+if train_val_df_var.empty:
+    print("[ERROR] Combined Train+Validation data empty after dropna. Cannot refit VAR.")
+    final_fit_var = None
+else:
+    try:
+        final_model_var = VAR(train_val_df_var.values)
+        final_fit_var = final_model_var.fit(maxlags=best_p, ic=None, trend='c')
+        # Assign names from combined data columns
+        final_fit_var.names = train_val_df_var.columns # Add names
+        print("[INFO] Final VAR model retrained.")
+    except Exception as e:
+        print(f"[ERROR] Final VAR model retraining failed: {e}")
+        final_fit_var = None
+
+# --- 5. Test Final Model (Rolling Forecast on Test Set) ---
+test_records_var = []
+prev_sig_var = 0
+
+if final_fit_var is not None and not test_df_var.empty:
+    print("[INFO] Evaluating final VAR model on fixed test set (using rolling forecast)...")
+    test_history = train_val_df_var.values[-(final_fit_var.k_ar):]
+    # Ensure target_col_idx matches refit model's columns 
+    target_col_idx_refit = list(train_val_df_var.columns).index(VAR_TARGET)
+
+    for i in range(len(test_df_var)):
+        t_test = test_df_var.index[i]
+        try:
+            test_forecast = final_fit_var.forecast(test_history, steps=1)
+            # Use correct index
+            y_hat_test = float(test_forecast[0, target_col_idx_refit])
+            y_real_test = float(test_df_var.iloc[i][VAR_TARGET])
+
+            sig_test = 1 if y_hat_test > 0 else (-1 if y_hat_test < 0 else 0)
+            legs_test = abs(sig_test - prev_sig_var)
+            cost_test = legs_test * ONE_WAY
+            pnl_test = sig_test * y_real_test - cost_test
+
+            test_records_var.append({
+                "date": t_test, "y_hat": y_hat_test, "y_real": y_real_test,
+                "signal": sig_test, "signal_prev": prev_sig_var, "cost": cost_test, "pnl": pnl_test,
+                "hyperparam": best_p
+            })
+            prev_sig_var = sig_test
+
+            actual_test_obs = test_df_var.values[i:i+1]
+            test_history = np.vstack([test_history[1:], actual_test_obs])
+
+        except Exception as e:
+            print(f"[WARN] VAR prediction failed at {t_test.date()}: {e}")
+            test_records_var.append({
+                "date": t_test, "y_hat": np.nan, "y_real": float(test_df_var.iloc[i][VAR_TARGET]),
+                "signal": 0, "signal_prev": prev_sig_var, "cost": 0, "pnl": 0,
+                "hyperparam": best_p
+            })
+            try:
+                actual_test_obs = test_df_var.values[i:i+1]
+                test_history = np.vstack([test_history[1:], actual_test_obs])
+            except: pass
+            prev_sig_var = 0
+
+    wf_var_fixed_res = pd.DataFrame.from_records(test_records_var)
+    if not wf_var_fixed_res.empty: wf_var_fixed_res = wf_var_fixed_res.set_index("date").sort_index()
+
+else:
+    print("[WARN] Final VAR model not trained or test set empty. Skipping evaluation.")
+    wf_var_fixed_res = pd.DataFrame()
+
+# --- 6. Register Results ---
+# Update model name to reflect ALL features 
+var_model_name = f"VAR({best_p})_FixedFWD_CC_AllFeat"
+register_results(var_model_name, wf_var_fixed_res)
+
+# Print head of results
+if not wf_var_fixed_res.empty:
+    print(f"\n[INFO] {var_model_name} (head of test results):")
+    print(wf_var_fixed_res.head())
+else:
+    print(f"[INFO] No results generated for {var_model_name}.")
+print("="*50)
+
+
+
+# %%
+# Summarize results from the store
+print("\n" + "="*40)
+print("PERFORMANCE SUMMARY (All Models)")
+print("="*40)
+# Assuming summarize_results function is defined in a previous cell
+# It should already handle saving the summary to CSV.
+results_summary = summarize_results(results_store)
+if results_summary is not None and not results_summary.empty:
+    print("\nSummary Statistics Table:")
+    # Display more precision in the summary table
+    with pd.option_context('display.float_format', '{:,.4f}'.format):
+        print(results_summary)
+else:
+     print("No model results available to summarize.")
+print("="*40)
+
+# --- Plotting Results ---
+# Plot only models present in the results_store
+if results_store:
+    plt.figure(figsize=(14, 8))
+    plot_count = 0
+
+    # Plot strategy cumulative returns
+    for name, df in results_store.items():
+        if df is not None and not df.empty and 'pnl' in df.columns:
+            # Add cumulative PnL column if needed
+            if 'cum_pnl' not in df.columns:
+                 df['cum_pnl'] = (1 + df['pnl'].fillna(0)).cumprod() - 1
+
+            # Ensure data is available for plotting
+            if not df['cum_pnl'].isna().all():
+                 plt.plot(df.index, df['cum_pnl'], label=f"{name} (Net)")
+                 plot_count += 1
+            else:
+                 print(f"[INFO] Skipping plot for {name} - cumulative PnL is all NaN.")
+
+    # Add Buy & Hold NVDA benchmark (Note: VAR used C-C returns, others used C-O)
+    # Be careful comparing C-C strategy PnL to C-O benchmark PnL directly on the same plot.
+    # We will plot the C-C benchmark relevant to the VAR model.
+    bh_df_source_var = None
+    bh_col_name_var = 'cum_bh_cc' # Cumulative Buy & Hold Close-to-Close
+    # Find the VAR results df to source the C-C benchmark y_real
+    var_model_key_pattern = r"VAR\(\d+\)_FixedFWD_CC_AllFeat" # Regex to find VAR model key
+    var_model_key = None
+    for key in results_store.keys():
+        if re.match(var_model_key_pattern, key):
+            var_model_key = key
+            break
+
+    if var_model_key and var_model_key in results_store:
+        var_df = results_store[var_model_key]
+        if var_df is not None and not var_df.empty and 'y_real' in var_df.columns:
+            bh_df_source_var = var_df.copy()
+            bh_df_source_var[bh_col_name_var] = (1 + bh_df_source_var['y_real'].fillna(0)).cumprod() - 1
+            if not bh_df_source_var[bh_col_name_var].isna().all():
+                 plt.plot(bh_df_source_var.index, bh_df_source_var[bh_col_name_var], label='BH NVDA CC', linestyle='--', color='green') # Different color for C-C
+                 plot_count += 1
+            else:
+                 bh_df_source_var = None # Reset if BH plot fails
+    if bh_df_source_var is None:
+         print("[WARN] Could not plot Buy & Hold NVDA (C-C) benchmark for VAR.")
+
+
+    # Add C-O benchmark for other models if present
+    bh_df_source_co = None
+    bh_col_name_co = 'cum_bh_co' # Cumulative Buy & Hold Close-to-Open
+    for name, df in results_store.items():
+         if 'Resid' in name and df is not None and not df.empty and 'y_real' in df.columns: # Find a C-O model
+            bh_df_source_co = df.copy()
+            bh_df_source_co[bh_col_name_co] = (1 + bh_df_source_co['y_real'].fillna(0)).cumprod() - 1
+            break
+    if bh_df_source_co is not None and not bh_df_source_co[bh_col_name_co].isna().all():
+         plt.plot(bh_df_source_co.index, bh_df_source_co[bh_col_name_co], label='BH NVDA CO', linestyle=':', color='black') # Different style/color for C-O
+         plot_count += 1
+    else:
+         print("[WARN] Could not plot Buy & Hold NVDA (C-O) benchmark for other models.")
+
+
+    if plot_count > 0:
+        # Determine overall date range for title
+        all_min_dates = [df.index.min() for df in results_store.values() if df is not None and not df.empty]
+        all_max_dates = [df.index.max() for df in results_store.values() if df is not None and not df.empty]
+
+        if all_min_dates and all_max_dates:
+             min_date_str = min(all_min_dates).date()
+             max_date_str = max(all_max_dates).date()
+             plt.title(f"Cumulative PnL Comparison (Test Periods ending {max_date_str})")
+        else:
+             plt.title("Cumulative PnL Comparison")
+
+        plt.xlabel("Date")
+        plt.ylabel("Cumulative Return")
+        plt.legend()
+        plt.grid(True)
+        # Save the plot
+        try:
+             plot_filename_cum = "cumulative_pnl_comparison_all_inc_var.png" # Updated filename
+             plt.savefig(RESULTS_DIR / plot_filename_cum)
+             print(f"[INFO] Cumulative PnL plot saved to {RESULTS_DIR / plot_filename_cum}")
+        except Exception as e:
+             print(f"[ERROR] Failed to save cumulative PnL plot: {e}")
+        plt.show() # Display the plot
+    else:
+        print("[INFO] No valid model results found to plot.")
+
+    # --- Plot lag 'p' chosen over time for the VAR model run (Fixed FWD) ---
+    # Find the VAR model key again (could be VAR(1) or VAR(10) depending on validation)
+    var_model_key_pattern = r"VAR\(\d+\)_FixedFWD_CC_AllFeat"
+    var_model_key_actual = None
+    for key in results_store.keys():
+        if re.match(var_model_key_pattern, key):
+            var_model_key_actual = key
+            break
+
+    if var_model_key_actual and var_model_key_actual in results_store:
+         var_df = results_store[var_model_key_actual]
+         # Note: For fixed validation, 'hyperparam' column will have the SAME best lag 'p' for all test rows.
+         if 'hyperparam' in var_df.columns and not var_df['hyperparam'].isna().all():
+              plt.figure(figsize=(14, 5))
+              chosen_p = int(var_df['hyperparam'].iloc[0]) # Get the constant integer lag
+
+              # Use scatter plot as value is constant for fixed validation test period
+              plt.scatter(var_df.index, var_df['hyperparam'], marker='.', label=f'Chosen Lag p ({chosen_p})')
+              # Use linear scale for lag p
+              plt.title(f"VAR Lag (p) Chosen During Fixed Validation (Test Period View)")
+              plt.xlabel("Date (Test Period)")
+              plt.ylabel("Lag Order (p)")
+              # Set integer ticks for y-axis if only few lags tested
+              unique_lags = sorted(var_df['hyperparam'].unique())
+              if len(unique_lags) < 15: # Adjust threshold if needed
+                   plt.yticks(unique_lags)
+              plt.legend()
+              plt.grid(True)
+              # Save the plot
+              try:
+                   plot_filename = f"{var_model_key_actual}_hyperparam_test_period.png"
+                   plt.savefig(RESULTS_DIR / plot_filename)
+                   print(f"[INFO] VAR hyperparameter plot saved to {RESULTS_DIR / plot_filename}")
+              except Exception as e:
+                   print(f"[ERROR] Failed to save hyperparameter plot for {var_model_key_actual}: {e}")
+              plt.show() # Display the plot
+         else:
+              print(f"[INFO] Hyperparameter column ('hyperparam') not available or empty for {var_model_key_actual}.")
+    else:
+         print(f"[INFO] Results for a VAR model (e.g., VAR(p)_FixedFWD_CC_AllFeat) not found in results_store.")
+
+else:
+    print("[INFO] results_store is empty. Nothing to plot.")
 
 # %% [markdown]
 # ### Model 3: GARCH(1,1) Regression
 
 # %%
-# ============================================================
-# ARX–GARCH(1,1) walk-forward for NVDA Close->Open (CO) returns
-# Manual mean & variance forecasts (no res.forecast x needed)
-# ============================================================
+# --- Ensure Config Variables and Data Exist ---
+# Required: X_y, FEATURE_COLS, LABEL_COL, CTRL_COL, use_peers, TRAIN_OFFSET, VAL_OFFSET, TEST_OFFSET, COST_BPS, ONE_WAY, calculate_betas, apply_resid_slice,
+#           register_results, ann_stats functions
 
-# -----------------------------
-# Expect X_y from your prep step:
-#   - index: trading dates
-#   - columns: peers/controls (close->close returns at t) + 'y_nvda_co' (NVDA close->open label)
-# -----------------------------
-if 'X_y' not in globals():
-    raise RuntimeError("X_y not found. Please run your data prep to create X_y (features at t and y_nvda_co).")
+# --- Add GARCH Specific Config ---
+Z_TAU = 0.3 # trade only if |mu|/sigma > Z_TAU (set None to always trade sign(mu))
 
-# -----------------------------
-# Config
-# -----------------------------
-MIN_TRAIN   = 250      # warm-up window (~1y)
-COST_BPS    = 5        # one-way bps per "leg" when position changes
-Z_TAU       = 0.3      # trade only if |mu|/sigma > Z_TAU (set None to always trade sign(mu))
-CTRL_COL    = "SOXX"
-PEER_CANDIDATES = ["SOXX","AMD","MSFT","TSM","AVGO"]  # small, stable set
+# --- 1. Check/Define Fixed Time Splits ---
+if 'train_df_raw' not in locals() or 'val_df_raw' not in locals() or 'test_df_raw' not in locals():
+     print("[INFO] Redefining fixed time splits for GARCH...")
+     dates = X_y.index
+     first_train_start = dates.min()
+     train_end_date = first_train_start + TRAIN_OFFSET - pd.Timedelta(days=1)
+     val_end_date = train_end_date + VAL_OFFSET
+     test_end_date = val_end_date + TEST_OFFSET # Or use dates.max()
 
-GARCH_PEERS = [c for c in PEER_CANDIDATES if c in X_y.columns]
-if CTRL_COL not in GARCH_PEERS and CTRL_COL in X_y.columns:
-    GARCH_PEERS = [CTRL_COL] + GARCH_PEERS
+     train_df_raw = X_y.loc[first_train_start : train_end_date]
+     val_df_raw   = X_y.loc[train_end_date + pd.Timedelta(days=1) : val_end_date]
+     test_df_raw  = X_y.loc[val_end_date + pd.Timedelta(days=1) : test_end_date]
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def ann_stats(r: pd.Series, periods_per_year=252):
-    r = r.dropna()
-    if r.empty:
-        return {"ann_ret": np.nan, "ann_vol": np.nan, "sharpe": np.nan}
-    mu  = r.mean() * periods_per_year
-    vol = r.std(ddof=1) * np.sqrt(periods_per_year)
-    shp = mu / vol if vol > 0 else np.nan
-    return {"ann_ret": mu, "ann_vol": vol, "sharpe": shp}
+     print(f"[INFO] Fixed Splits | Train: {train_df_raw.index.min().date()} to {train_df_raw.index.max().date()} ({len(train_df_raw)} days)")
+     print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()} to {val_df_raw.index.max().date()} ({len(val_df_raw)} days)")
+     print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()} to {test_df_raw.index.max().date()} ({len(test_df_raw)} days)")
 
-# Peer idiosyncratic moves using only past data: peer_res = peer - beta*ctrl
-def build_resid_matrix_past(Xhist: pd.DataFrame, cols, ctrl=CTRL_COL):
-    out = pd.DataFrame(index=Xhist.index)
-    if ctrl in Xhist.columns:
-        out[ctrl] = Xhist[ctrl]
-    for p in [c for c in cols if c != ctrl and c in Xhist.columns]:
-        df_tr = Xhist[[p, ctrl]].dropna()
-        if len(df_tr) >= 50 and df_tr[ctrl].std() > 1e-8:
-            lr = LinearRegression().fit(df_tr[[ctrl]], df_tr[p])
-            beta = float(lr.coef_[0])
-            out[p + "_res"] = Xhist[p] - beta * Xhist[ctrl]
-        else:
-            out[p + "_res"] = np.nan
-    return out
+     if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+         raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
+else:
+     print("[INFO] Using existing fixed time splits.")
 
-# GARCH(1,1) model, where sigma^2_{t+1} = omega + alpha * resid_t^2 + beta * sigma_t^2
+# --- 2. Check/Recalculate Betas ONCE on Training Data ---
+if 'betas_fixed' not in locals():
+    print("[INFO] Calculating residualization betas on fixed training set for GARCH...")
+    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+    print(f"[INFO] Betas calculated: { {k: f'{v:.4f}' for k, v in betas_fixed.items()} }")
+else:
+    print("[INFO] Using existing fixed betas.")
+
+# --- 3. Check/Apply Residualization to All Fixed Sets ---
+if ('X_train_res' not in locals() or 'X_val_res' not in locals() or 'X_test_res' not in locals() or
+    'final_feature_cols' not in locals() or 'y_train' not in locals() or 'y_val' not in locals() or 'y_test' not in locals()):
+    print("[INFO] Applying residualization to Train, Val, Test sets for GARCH...")
+    X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+    X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+    X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+
+    # Define final feature columns based on residualization
+    final_feature_cols = []
+    if CTRL_COL in FEATURE_COLS: final_feature_cols.append(CTRL_COL)
+    final_feature_cols += [p + "_res" for p in use_peers]
+    print(f"[INFO] Using residualized features: {final_feature_cols}")
+
+    # Align target variables
+    y_train = train_df_raw[LABEL_COL]
+    y_val   = val_df_raw[LABEL_COL]
+    y_test  = test_df_raw[LABEL_COL]
+else:
+    print("[INFO] Using existing residualized Train, Val, Test sets and features.")
+
+# --- Define GARCH Variance Forecast Helper ---
+# GARCH(1,1) model: sigma^2_{t+1} = omega + alpha * resid_t^2 + beta * sigma_t^2
 def manual_garch11_next_var(res, last_resid: float, last_sigma: float):
+    """Calculates the 1-step variance forecast from fitted GARCH(1,1) results."""
     params = res.params
     omega  = float(params.get('omega', 0.0))
+    # Handle potential naming variations in arch library output
     alpha1 = float(params.get('alpha[1]', params.get('alpha', 0.0)))
     beta1  = float(params.get('beta[1]',  params.get('beta',  0.0)))
+    # Ensure variance is non-negative
     return max(omega + alpha1*(last_resid**2) + beta1*(last_sigma**2), 0.0)
 
-def walk_forward_arx_garch_manual(Xy: pd.DataFrame, cols, min_train=250, cost_bps=5, z_tau=0.3):
-    dates    = Xy.index
-    one_way  = cost_bps / 10000.0
-    records  = []
-    pos_prev = 0
 
-    # Exogenous order: [CTRL_COL] + residualized peers in fixed order
-    exog_cols_base = []
-    if CTRL_COL in cols:
-        exog_cols_base.append(CTRL_COL)
-    exog_cols_base += [c + "_res" for c in cols if c != CTRL_COL]
+# --- 4. Fit ARX-GARCH Model ONCE on Train+Val ---
+print(f"\n[INFO] Fitting final ARX-GARCH(1,1) model on Train+Validation data...")
+X_tv_res = pd.concat([X_train_res, X_val_res], axis=0)
+y_tv = pd.concat([y_train, y_val], axis=0)
 
-    for i in range(min_train, len(dates) - 1):
-        t_pred = dates[i]
+# Prepare combined data for fitting (use common features and drop NaNs)
+common_features_fit = X_tv_res.columns.intersection(final_feature_cols).tolist()
+if not common_features_fit:
+    print("[ERROR] No common residualized features found for GARCH fitting.")
+    final_garch_fit = None
+else:
+    fit_df = X_tv_res[common_features_fit].join(y_tv).dropna()
+    if fit_df.empty or len(fit_df) < 200: # Check if enough data after NaN drop
+        print(f"[ERROR] Not enough valid data ({len(fit_df)}) in Train+Val for GARCH fitting.")
+        final_garch_fit = None
+    else:
+        Xtv_fit = fit_df[common_features_fit].values.astype(float)
+        ytv_fit = fit_df[LABEL_COL].values.astype(float)
 
-        # --- Past data up to t-1
-        X_past = Xy.loc[dates[:i], cols]
-        y_past = Xy.loc[dates[:i], "y_nvda_co"]
+        try:
+            am = arch_model(ytv_fit, mean='ARX', lags=0, x=Xtv_fit,
+                            vol='GARCH', p=1, q=1, dist='normal', rescale=False)
+            final_garch_fit = am.fit(disp='off')
+            print("[INFO] Final ARX-GARCH model fitted.")
+            # print(final_garch_fit.summary()) # Optional: print summary
+        except Exception as e:
+            print(f"[ERROR] Final ARX-GARCH model fitting failed: {e}")
+            final_garch_fit = None
 
-        # Residualize peers using ONLY past data
-        Xpast_res = build_resid_matrix_past(X_past, cols, ctrl=CTRL_COL)
-        train_df  = Xpast_res.join(y_past).dropna()
-        if train_df.shape[0] < 200:
-            continue
+# --- 5. Test Final Model (Iterative 1-step Forecasts) ---
+test_records_garch = []
+prev_sig_garch = 0
 
-        exog_cols = [c for c in exog_cols_base if c in train_df.columns]
-        if not exog_cols:
-            continue
+if final_garch_fit is not None and not X_test_res.empty:
+    print("[INFO] Evaluating final GARCH model on fixed test set (iterative forecast)...")
 
-        X_train = train_df[exog_cols].values.astype(float)    # (n, m)
-        y_train = train_df["y_nvda_co"].values.astype(float)  # (n,)
+    # Get features used in the fitted model
+    model_feature_names = common_features_fit # Features used during fitting
+    params = final_garch_fit.params
 
-        # Fit ARX mean + GARCH(1,1) vol (rescale=False keeps return units)
-        am  = arch_model(y_train, mean='ARX', lags=0, x=X_train,
-                         vol='GARCH', p=1, q=1, dist='normal', rescale=False)
-        res = am.fit(disp='off')
+    # Get the last residual and conditional volatility from the fitted model (end of Train+Val)
+    last_resid_fit = float(final_garch_fit.resid[-1])
+    last_sigma_fit = float(final_garch_fit.conditional_volatility[-1])
 
-        # --- Build exogenous vector x_t at time t (residualize row t with past betas)
-        rowX = Xy.loc[t_pred, cols]
-        row_res = {}
-        if CTRL_COL in cols and CTRL_COL in rowX.index:
-            row_res[CTRL_COL] = float(rowX[CTRL_COL])
-        for p in [c for c in cols if c != CTRL_COL]:
-            if p in X_past.columns and CTRL_COL in X_past.columns:
-                df_tr = X_past[[p, CTRL_COL]].dropna()
-                if len(df_tr) >= 50 and df_tr[CTRL_COL].std() > 1e-8:
-                    lr = LinearRegression().fit(df_tr[[CTRL_COL]], df_tr[p])
-                    row_res[p + "_res"] = float(rowX.get(p, np.nan)) - float(lr.coef_[0]) * float(rowX.get(CTRL_COL, 0.0))
-                else:
-                    row_res[p + "_res"] = np.nan
+    # Initialize forecast variables with the last values from the fit
+    current_last_resid = last_resid_fit
+    current_last_sigma = last_sigma_fit
 
-        x_t = np.array([[row_res.get(c, np.nan) for c in exog_cols]], dtype=float)
-        if np.isnan(x_t).any():
-            continue
+    # Prepare test features - use only columns the model was trained on
+    X_test_predict = X_test_res[model_feature_names].copy()
 
-        # --- Manual mean forecast: mu_hat = Const + sum_j x_j * beta_j
-        params = res.params
-        mu_hat = float(params.get('Const', 0.0))
-        for j in range(x_t.shape[1]):
-            coef_name = f'x{j}'
-            if coef_name in params.index:
-                mu_hat += float(params[coef_name]) * float(x_t[0, j])
+    for t in test_df_raw.index: # Iterate through test period dates
+        if t not in X_test_predict.index: # Skip if date missing after residualization/dropna
+             print(f"[WARN] Skipping forecast for {t.date()} - features missing.")
+             continue
 
-        # --- Manual variance forecast using last residual & last sigma
-        last_resid = float(res.resid[-1])                         # epsilon_t
-        last_sigma = float(res.conditional_volatility[-1])        # sigma_t
-        var_hat    = manual_garch11_next_var(res, last_resid, last_sigma)
-        sigma_hat  = float(np.sqrt(var_hat))
+        xt_res_values = X_test_predict.loc[[t]].values.astype(float) # Get features for day t
+        y_real_test = float(test_df_raw.loc[t, LABEL_COL])
 
-        # --- Trading signal
-        if z_tau is not None and sigma_hat > 0:
-            z = mu_hat / sigma_hat
-            sig = 1 if z >  z_tau else (-1 if z < -z_tau else 0)
+        if np.isnan(xt_res_values).any():
+            mu_hat = np.nan
+            sigma_hat = np.nan
+            print(f"[WARN] NaN features for {t.date()}, cannot forecast.")
         else:
-            sig = 1 if mu_hat > 0 else (-1 if mu_hat < 0 else 0)
+            # --- Manual mean forecast: mu_hat = Const + sum_j x_j * beta_j ---
+            mu_hat = float(params.get('Const', 0.0))
+            for j in range(xt_res_values.shape[1]):
+                coef_name = f'x{j}'
+                if coef_name in params.index:
+                    mu_hat += float(params[coef_name]) * float(xt_res_values[0, j])
 
-        # --- Realized CO return & PnL
-        y_real = float(Xy.loc[t_pred, "y_nvda_co"])
-        legs   = abs(sig - pos_prev)      # 0,1,2 legs
-        cost   = legs * one_way
-        pnl    = sig * y_real - cost
+            # --- Manual variance forecast using previous step's residual & sigma ---
+            var_hat = manual_garch11_next_var(final_garch_fit, current_last_resid, current_last_sigma) # CALL THE HELPER
+            sigma_hat = float(np.sqrt(var_hat))
 
-        records.append({
-            "date": t_pred,
-            "mu_hat": mu_hat,
-            "sigma_hat": sigma_hat,
-            "z_score": (mu_hat / sigma_hat) if sigma_hat > 0 else np.nan,
-            "y_real": y_real,
-            "signal": sig,
-            "signal_prev": pos_prev,
-            "cost": cost,
-            "pnl": pnl
+        # --- Trading signal ---
+        if Z_TAU is not None and sigma_hat > 1e-9: # Check sigma_hat > 0
+            z = mu_hat / sigma_hat if not pd.isna(mu_hat) else np.nan
+            sig_test = 1 if z > Z_TAU else (-1 if z < -Z_TAU else 0) if not pd.isna(z) else 0
+        elif not pd.isna(mu_hat):
+            sig_test = 1 if mu_hat > 0 else (-1 if mu_hat < 0 else 0)
+        else: # Handle NaN mu_hat
+            sig_test = 0
+
+        # --- Calculate PnL ---
+        if pd.isna(y_real_test) or pd.isna(mu_hat) or pd.isna(sigma_hat):
+             pnl_test = 0.0 # Assign 0 PnL if cannot trade or outcome unknown
+             legs_test = abs(sig_test - prev_sig_garch)
+             cost_test = legs_test * ONE_WAY
+             # Ensure signal is 0 if forecast failed
+             if pd.isna(mu_hat) or pd.isna(sigma_hat): sig_test = 0
+        else:
+             legs_test = abs(sig_test - prev_sig_garch)
+             gross_pnl_test = sig_test * y_real_test
+             cost_test = legs_test * ONE_WAY
+             pnl_test = gross_pnl_test - cost_test
+
+        test_records_garch.append({
+            "date": t, "mu_hat": mu_hat, "sigma_hat": sigma_hat,
+            "z_score": (mu_hat / sigma_hat) if sigma_hat > 1e-9 and not pd.isna(mu_hat) else np.nan,
+            "y_real": y_real_test, "signal": sig_test, "signal_prev": prev_sig_garch,
+            "cost": cost_test, "pnl": pnl_test, "hyperparam": "GARCH(1,1)" # Store model type
         })
-        pos_prev = sig
 
-    return pd.DataFrame.from_records(records).set_index("date").sort_index()
+        # --- Update last residual and sigma for the NEXT forecast ---
+        # Actual residual for day t (if prediction was possible)
+        if not pd.isna(mu_hat) and not pd.isna(y_real_test):
+            current_last_resid = y_real_test - mu_hat
+        else:
+            current_last_resid = 0.0 # Or np.nan? Using 0 might be more stable for variance forecast
 
-# -----------------------------
-# Run & evaluate
-# -----------------------------
-wf_garch = walk_forward_arx_garch_manual(
-    X_y, cols=GARCH_PEERS, min_train=MIN_TRAIN,
-    cost_bps=COST_BPS, z_tau=Z_TAU
-)
+        # Sigma used for the next step is the one forecasted for *this* step
+        if not pd.isna(sigma_hat):
+            current_last_sigma = sigma_hat
+        else:
+            # Handle NaN sigma forecast - maybe use average historical vol? Or keep last known good one?
+            # Keeping the last known good one might be simplest here.
+            pass # Keep current_last_sigma as it was
 
-print("[INFO] wf_garch head:")
-print(wf_garch.head())
+        prev_sig_garch = sig_test # Update previous signal
 
-def summarize_results(wf: pd.DataFrame):
-    net   = wf["pnl"]
-    gross = wf["signal"] * wf["y_real"]
-    bh    = wf["y_real"]  # buy & hold overnight benchmark
+    wf_garch_fixed_res = pd.DataFrame.from_records(test_records_garch)
+    if not wf_garch_fixed_res.empty: wf_garch_fixed_res = wf_garch_fixed_res.set_index("date").sort_index()
 
-    stats_net   = ann_stats(net)
-    stats_gross = ann_stats(gross)
-    stats_bh    = ann_stats(bh)
+else:
+    print("[WARN] Final GARCH model not trained or test set empty. Skipping evaluation.")
+    wf_garch_fixed_res = pd.DataFrame() # Create empty DF
 
-    delta_pos = (wf["signal"] - wf["signal_prev"]).abs()
-    turnover_legs_per_day = delta_pos.mean()
-    pct_long  = (wf["signal"] ==  1).mean()
-    pct_short = (wf["signal"] == -1).mean()
-    pct_flat  = (wf["signal"] ==  0).mean()
+# --- 6. Register Results ---
+garch_model_name = "ARXGARCH_FixedFWD_Resid" # Indicate Fixed Forward
+register_results(garch_model_name, wf_garch_fixed_res)
 
-    print("\n[RESULTS — ARX–GARCH Close→Open]")
-    print("Strategy (NET) : ann_ret={ann_ret:.4f} ann_vol={ann_vol:.4f} Sharpe={sharpe:.2f}".format(**stats_net))
-    print("Strategy (GROSS): ann_ret={ann_ret:.4f} ann_vol={ann_vol:.4f} Sharpe={sharpe:.2f}".format(**stats_gross))
-    print("BH NVDA (C→O)  : ann_ret={ann_ret:.4f} ann_vol={ann_vol:.4f} Sharpe={sharpe:.2f}".format(**stats_bh))
-    print(f"Turnover (legs/day): {turnover_legs_per_day:.3f}")
-    print(f"Exposure: long={(pct_long):.1%}  short={(pct_short):.1%}  flat={(pct_flat):.1%}")
+# Optional: Print head of results
+if not wf_garch_fixed_res.empty:
+    print(f"\n[INFO] {garch_model_name} (head of test results):")
+    print(wf_garch_fixed_res.head())
+else:
+    print(f"[INFO] No results generated for {garch_model_name}.")
+print("="*50)
 
-    # Cumulative curves
-    try:
-        import matplotlib.pyplot as plt
-        wf = wf.copy()
-        wf["cumulative_strat_net"]   = (1 + net).cumprod()
-        wf["cumulative_strat_gross"] = (1 + gross).cumprod()
-        wf["cumulative_bh"]          = (1 + bh).cumprod()
+# %%
+# Summarize results from the store
+print("\n" + "="*40)
+print("PERFORMANCE SUMMARY (All Models)")
+print("="*40)
+# Assuming summarize_results function is defined in a previous cell
+# It should already handle saving the summary to CSV.
+results_summary = summarize_results(results_store)
+if results_summary is not None and not results_summary.empty:
+    print("\nSummary Statistics Table:")
+    # Display more precision in the summary table
+    with pd.option_context('display.float_format', '{:,.4f}'.format):
+        print(results_summary)
+else:
+     print("No model results available to summarize.")
+print("="*40)
 
-        wf[["cumulative_strat_net","cumulative_bh"]].plot(title="Cumulative Return (CO): ARX–GARCH (Net) vs Buy&Hold")
-        plt.xlabel("Date"); plt.ylabel("Growth of $1"); plt.show()
+# --- Plotting Results ---
+# Plot only models present in the results_store
+if results_store:
+    plt.figure(figsize=(14, 8))
+    plot_count = 0
 
-        wf[["cumulative_strat_gross","cumulative_strat_net"]].plot(title="Strategy Gross vs Net (cost drag)")
-        plt.xlabel("Date"); plt.ylabel("Growth of $1"); plt.show()
-    except Exception as e:
-        print("[WARN] Plotting skipped:", e)
+    # Plot strategy cumulative returns
+    for name, df in results_store.items():
+        if df is not None and not df.empty and 'pnl' in df.columns:
+            # Add cumulative PnL column if needed
+            if 'cum_pnl' not in df.columns:
+                 df['cum_pnl'] = (1 + df['pnl'].fillna(0)).cumprod() - 1
 
-summarize_results(wf_garch)
+            # Ensure data is available for plotting
+            if not df['cum_pnl'].isna().all():
+                 plt.plot(df.index, df['cum_pnl'], label=f"{name} (Net)")
+                 plot_count += 1
+            else:
+                 print(f"[INFO] Skipping plot for {name} - cumulative PnL is all NaN.")
 
+    # --- Add Relevant Buy & Hold Benchmarks ---
+    # Add C-C benchmark if VAR results exist
+    bh_df_source_var = None
+    bh_col_name_var = 'cum_bh_cc' # Cumulative Buy & Hold Close-to-Close
+    var_model_key_pattern = r"VAR\(\d+\)_FixedFWD_CC_AllFeat" # Regex to find VAR model key
+    var_model_key = None
+    for key in results_store.keys():
+        if re.match(var_model_key_pattern, key):
+            var_model_key = key
+            break
+    if var_model_key and var_model_key in results_store:
+        var_df = results_store[var_model_key]
+        if var_df is not None and not var_df.empty and 'y_real' in var_df.columns:
+            bh_df_source_var = var_df.copy()
+            bh_df_source_var[bh_col_name_var] = (1 + bh_df_source_var['y_real'].fillna(0)).cumprod() - 1
+            if not bh_df_source_var[bh_col_name_var].isna().all():
+                 plt.plot(bh_df_source_var.index, bh_df_source_var[bh_col_name_var], label='BH NVDA CC', linestyle='--', color='green')
+                 plot_count += 1
+            else: bh_df_source_var = None
+    if bh_df_source_var is None: print("[INFO] C-C Benchmark (for VAR) not plotted.")
+
+    # Add C-O benchmark if GARCH or other C-O models exist
+    bh_df_source_co = None
+    bh_col_name_co = 'cum_bh_co' # Cumulative Buy & Hold Close-to-Open
+    for name, df in results_store.items():
+         # Find a C-O model (like GARCH or the Resid models)
+         if ('Resid' in name or 'GARCH' in name) and df is not None and not df.empty and 'y_real' in df.columns:
+            bh_df_source_co = df.copy()
+            bh_df_source_co[bh_col_name_co] = (1 + bh_df_source_co['y_real'].fillna(0)).cumprod() - 1
+            break
+    if bh_df_source_co is not None and not bh_df_source_co[bh_col_name_co].isna().all():
+         plt.plot(bh_df_source_co.index, bh_df_source_co[bh_col_name_co], label='BH NVDA CO', linestyle=':', color='black')
+         plot_count += 1
+    else: print("[WARN] Could not plot Buy & Hold NVDA (C-O) benchmark.")
+
+    # --- Finalize Cumulative Plot ---
+    if plot_count > 0:
+        all_min_dates = [df.index.min() for df in results_store.values() if df is not None and not df.empty]
+        all_max_dates = [df.index.max() for df in results_store.values() if df is not None and not df.empty]
+        if all_min_dates and all_max_dates:
+             min_date_str = min(all_min_dates).date(); max_date_str = max(all_max_dates).date()
+             plt.title(f"Cumulative PnL Comparison (Test Periods ending {max_date_str})")
+        else: plt.title("Cumulative PnL Comparison")
+        plt.xlabel("Date"); plt.ylabel("Cumulative Return"); plt.legend(); plt.grid(True)
+        try:
+             plot_filename_cum = "cumulative_pnl_comparison_all_inc_garch.png" # Updated filename
+             plt.savefig(RESULTS_DIR / plot_filename_cum)
+             print(f"[INFO] Cumulative PnL plot saved to {RESULTS_DIR / plot_filename_cum}")
+        except Exception as e: print(f"[ERROR] Failed to save cumulative PnL plot: {e}")
+        plt.show()
+    else: print("[INFO] No valid model results found to plot cumulative returns.")
+
+    # --- Hyperparameter Plot Section ---
+    # Check for GARCH model results - Note: Fixed GARCH(1,1) has no tuned hyperparameter to plot
+    garch_model_key = "ARXGARCH_FixedFWD_Resid"
+    if garch_model_key in results_store:
+         garch_df = results_store[garch_model_key]
+         if 'hyperparam' in garch_df.columns and not garch_df['hyperparam'].isna().all():
+              # The 'hyperparam' column stores the string "GARCH(1,1)"
+              # There's no numerical hyperparameter that was tuned and varied over time to plot.
+              print(f"\n[INFO] Model '{garch_model_key}' used a fixed GARCH(1,1) structure.")
+              print("[INFO] No hyperparameter tuning plot applicable for this GARCH implementation.")
+              # Optionally, you could plot the z_score or sigma_hat over time if desired:
+              # if 'z_score' in garch_df.columns:
+              #      plt.figure(figsize=(14, 5))
+              #      plt.plot(garch_df.index, garch_df['z_score'], label='Forecast Z-Score')
+              #      plt.title(f"{garch_model_key} Forecast Z-Score Over Test Period")
+              #      plt.xlabel("Date"); plt.ylabel("Z-Score"); plt.legend(); plt.grid(True); plt.show()
+              # if 'sigma_hat' in garch_df.columns:
+              #      plt.figure(figsize=(14, 5))
+              #      plt.plot(garch_df.index, garch_df['sigma_hat'], label='Forecast Sigma (Volatility)')
+              #      plt.title(f"{garch_model_key} Forecast Sigma Over Test Period")
+              #      plt.xlabel("Date"); plt.ylabel("Sigma"); plt.legend(); plt.grid(True); plt.show()
+         else:
+              print(f"[INFO] Hyperparameter column ('hyperparam') not available or empty for {garch_model_key}.")
+    else:
+         print(f"[INFO] Results for {garch_model_key} not found in results_store for hyperparameter check.")
+
+else:
+    print("[INFO] results_store is empty. Nothing to plot.")
+
+
+# %% [markdown]
+# #### Potential models:
+# 1. Some kind of random forest regressor / tree basd ensemble like XGBoost or LightGBM
+# 2. Probbly good to also implement some kind of SVR based on Profs notes, or convert to a classification approach (up or down) and implement SVMs and Logistic Regression
+
+# %% [markdown]
+# ### References
+
+# %% [markdown]
+# 1. Kelly, B. T., Malamud, S., & Zhou, K. (2024). The virtue of complexity in return prediction
+# 2. Chinco, A. M., Clark-Joseph, A. D., & Ye, M. (2019). Sparse signals in the cross‐section of returns.
+# 3. https://medium.com/@shruti.dhumne/elastic-net-regression-detailed-guide-99dce30b8e6e
+# 4. https://medium.com/@adamhassouni111/a-comprehensive-guide-to-implementing-arima-garch-for-trading-strategies-60a48ac3f08f
+# 5. https://www.kaggle.com/code/achrafbenssassi/advanced-trading-strategy-using-garch-model-and-bb
+# 6. https://www.statsmodels.org/stable/ (for VAR model)
+#
+# Also searching some Kaggle Competitions for "stock prediction" or "time series forecasting", they often use LGBM/XGBoost as usual from kaggle, so worth exploring.
+
+# %% [markdown]
+# ### Archive
+
+# %%
+# # Generic Walk-Forward Function using a specified model helper (need to test), backtest using time-based rolling windows, row-by-row residualization, and a specified tuning 
+# # helper.
+# def walk_forward_generic(
+#     X_y: pd.DataFrame,
+#     tuning_helper_func: callable, # e.g., _best_alpha_by_val_ridge
+#     model_name: str,              # e.g., "Lasso"
+#     feature_cols=FEATURE_COLS,
+#     label_col=LABEL_COL,
+#     ctrl_col=CTRL_COL,
+#     peers_list=use_peers,
+#     train_offset=TRAIN_OFFSET,
+#     val_offset=VAL_OFFSET,
+#     test_offset=TEST_OFFSET,
+#     predict_step=PREDICT_STEP,
+#     hyperparam_grid=None, # Passed to helper, format depends on helper
+#     cost_one_way=ONE_WAY
+# ):
+#     dates = X_y.index
+#     first_train_start = dates.min()
+#     first_predict_date = first_train_start + train_offset + val_offset
+#     last_date = dates.max()
+#     test_period_start_date = last_date - test_offset + pd.Timedelta(days=1)
+
+#     if first_predict_date > last_date: raise ValueError(f"Not enough data for {model_name}.")
+
+#     actual_first_predict_idx = dates.searchsorted(first_predict_date)
+#     if actual_first_predict_idx >= len(dates): raise ValueError(f"First prediction date beyond data for {model_name}.")
+#     actual_first_predict_date = dates[actual_first_predict_idx]
+
+#     test_start_idx = dates.searchsorted(test_period_start_date)
+#     if test_start_idx >= len(dates):
+#         print(f"[WARN] {model_name}: Test period start beyond data.")
+#         test_start_idx = actual_first_predict_idx
+
+#     print(f"[INFO] {model_name} Backtest | First prediction: {actual_first_predict_date.date()} | Test start: {dates[test_start_idx].date()} | Last date: {last_date.date()}")
+
+#     records = []
+#     prev_sig = 0
+
+#     resid_feature_cols = []
+#     if ctrl_col in feature_cols: resid_feature_cols.append(ctrl_col)
+#     resid_feature_cols += [p + "_res" for p in peers_list]
+
+#     current_predict_idx = actual_first_predict_idx
+#     while current_predict_idx < len(dates):
+#         t = dates[current_predict_idx]
+
+#         val_end_date = t - pd.Timedelta(days=1)
+#         val_start_date = val_end_date - val_offset + pd.Timedelta(days=1)
+#         train_end_date = val_start_date - pd.Timedelta(days=1)
+#         train_start_date = train_end_date - train_offset + pd.Timedelta(days=1)
+#         train_start_date = max(train_start_date, first_train_start)
+#         val_start_date = max(val_start_date, first_train_start)
+
+#         hist_train_raw = X_y.loc[train_start_date : train_end_date]
+#         hist_val_raw   = X_y.loc[val_start_date : val_end_date]
+#         row_t_raw      = X_y.loc[t]
+
+#         if hist_train_raw.empty or hist_val_raw.empty:
+#             if t >= dates[test_start_idx]: records.append({"date": t, "y_hat": np.nan, "y_real": float(row_t_raw.get(label_col, np.nan)), "hyperparam": np.nan, "signal": 0, "signal_prev": prev_sig, "cost": 0, "pnl": 0})
+#             current_predict_idx += 1; continue
+
+#         train_X_for_resid_t = X_y.loc[train_start_date : val_end_date, feature_cols]
+#         xt_res_series = residualize_row(train_X_for_resid_t, row_t_raw[feature_cols], ctrl_col, peers_list)
+
+#         Xva_res_list = []
+#         for val_idx, val_row in hist_val_raw.iterrows():
+#             train_X_for_resid_val = X_y.loc[train_start_date : val_idx - pd.Timedelta(days=1), feature_cols]
+#             if not train_X_for_resid_val.empty: res_row = residualize_row(train_X_for_resid_val, val_row[feature_cols], ctrl_col, peers_list); res_row.name = val_idx; Xva_res_list.append(res_row)
+#         Xva_res = pd.DataFrame(Xva_res_list) if Xva_res_list else pd.DataFrame(columns=resid_feature_cols)
+
+#         Xtr_res_list = []
+#         for train_idx, train_row in hist_train_raw.iterrows():
+#              train_X_for_resid_train = X_y.loc[train_start_date : train_idx - pd.Timedelta(days=1), feature_cols]
+#              if not train_X_for_resid_train.empty: res_row = residualize_row(train_X_for_resid_train, train_row[feature_cols], ctrl_col, peers_list); res_row.name = train_idx; Xtr_res_list.append(res_row)
+#         Xtr_res = pd.DataFrame(Xtr_res_list) if Xtr_res_list else pd.DataFrame(columns=resid_feature_cols)
+
+#         ytr = hist_train_raw[label_col]; yva = hist_val_raw[label_col]; y_real = float(row_t_raw[label_col])
+
+#         # Call the specific tuning helper
+#         if "alphas" in tuning_helper_func.__code__.co_varnames:
+#             best_hyperparam, final_model = tuning_helper_func(Xtr_res, ytr, Xva_res, yva, alphas=hyperparam_grid)
+#         else: # For ENet helper that takes multiple grids
+#             best_hyperparam, final_model = tuning_helper_func(Xtr_res, ytr, Xva_res, yva)
+
+
+#         if final_model is None:
+#             print(f"[WARN] {model_name} model fitting failed for {t.date()}. Skipping.")
+#             if t >= dates[test_start_idx]: records.append({"date": t, "y_hat": np.nan, "y_real": y_real, "hyperparam": best_hyperparam, "signal": 0, "signal_prev": prev_sig, "cost": 0, "pnl": 0})
+#             current_predict_idx += 1; continue
+
+#         model_features = final_model.feature_names_in_
+#         xt_res_series_aligned = xt_res_series.reindex(model_features)
+#         xt_res_df = pd.DataFrame([xt_res_series_aligned.values], index=[t], columns=model_features)
+
+#         if xt_res_df.isnull().any().any(): y_hat = np.nan; sig = 0
+#         else:
+#              try: y_hat = float(final_model.predict(xt_res_df)[0]); sig = 1 if y_hat > 0 else (-1 if y_hat < 0 else 0)
+#              except Exception as e: print(f"[ERROR] {model_name} prediction failed at {t.date()}: {e}"); y_hat = np.nan; sig = 0
+
+#         if pd.isna(y_real): pnl = np.nan; legs = abs(sig - prev_sig); trade_cost = legs * cost_one_way
+#         else: legs = abs(sig - prev_sig); gross_pnl = sig * y_real; trade_cost = legs * cost_one_way; pnl = gross_pnl - trade_cost
+
+#         if t >= dates[test_start_idx]:
+#             records.append({"date": t, "y_hat": y_hat, "y_real": y_real, "hyperparam": best_hyperparam, "signal": sig, "signal_prev": prev_sig, "cost": trade_cost, "pnl": pnl})
+
+#         prev_sig = sig
+#         current_predict_idx += 1
+
+#     print(f"[INFO] ...{model_name} Backtest complete.")
+#     wf = pd.DataFrame.from_records(records)
+#     if not wf.empty: wf = wf.set_index("date").sort_index()
+#     return wf
+
+
+# # --- Helper function for LASSO hyperparameter tuning ---
+# def _best_alpha_by_val_lasso(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID_LASSO):
+#     """
+#     Trains Lasso for each alpha ON RESIDUALIZED FEATURES, finds lowest MSE on validation,
+#     and refits on combined (train + validation) residualized data.
+#     """
+#     best_alpha, best_mse = None, np.inf
+#     common_features = X_train_res.columns.intersection(X_val_res.columns).tolist()
+#     if not common_features: return 1e-3, None # Default alpha, no model
+
+#     for a in alphas:
+#         # Increase max_iter for Lasso convergence
+#         pipe = Pipeline([
+#             ("scaler", StandardScaler(with_mean=True, with_std=True)),
+#             ("lasso",  Lasso(alpha=a, random_state=42, max_iter=2000))
+#         ])
+#         train_fit_df = X_train_res[common_features].join(y_train).dropna();
+#         if train_fit_df.empty: continue
+#         Xtr_fit, ytr_fit = train_fit_df[common_features], train_fit_df[y_train.name]
+#         if Xtr_fit.empty: continue
+#         try: pipe.fit(Xtr_fit, ytr_fit)
+#         except ValueError as e: print(f"[WARN] Lasso pipe fitting failed for alpha {a}: {e}"); continue
+
+#         Xva_pred_ready = X_val_res[common_features].dropna()
+#         if Xva_pred_ready.empty: mse = np.inf
+#         else:
+#              yva_aligned = y_val.loc[Xva_pred_ready.index].dropna()
+#              valid_idx = Xva_pred_ready.index.intersection(yva_aligned.index)
+#              if valid_idx.empty: mse = np.inf
+#              else:
+#                   Xva_pred_final = Xva_pred_ready.loc[valid_idx]; yva_aligned_final = yva_aligned.loc[valid_idx]
+#                   if Xva_pred_final.empty: mse = np.inf
+#                   else: y_pred_val = pipe.predict(Xva_pred_final); mse = mean_squared_error(yva_aligned_final, y_pred_val)
+#         if mse < best_mse: best_mse, best_alpha = mse, a
+
+#     if best_alpha is None: best_alpha = 1e-3; print("[WARN] No best alpha found for Lasso. Defaulting.")
+
+#     X_tv_res = pd.concat([X_train_res, X_val_res], axis=0)[common_features]; y_tv = pd.concat([y_train, y_val], axis=0)
+#     final_pipe = Pipeline([("scaler", StandardScaler(with_mean=True, with_std=True)), ("lasso", Lasso(alpha=best_alpha, random_state=42, max_iter=2000))])
+#     final_fit_df = X_tv_res.join(y_tv).dropna()
+#     if final_fit_df.empty: print("[ERROR] Lasso final fit data empty."); return best_alpha, None
+#     try: final_pipe.fit(final_fit_df[common_features], final_fit_df[y_tv.name])
+#     except ValueError as e: print(f"[ERROR] Lasso final pipe fitting failed: {e}"); return best_alpha, None
+#     return best_alpha, final_pipe
+
+
+# # --- Execute Lasso Backtest ---
+# print("\n" + "="*50); print("Executing Lasso Backtest"); print("="*50)
+# wf_lasso_time_res = walk_forward_generic(
+#     X_y,
+#     _best_alpha_by_val_lasso,           # Lasso-specific tuning helper
+#     "Lasso",                            # Model name for logging/registration
+#     hyperparam_grid=ALPHA_GRID_LASSO    # Pass the Lasso alpha grid
+# )
+
+# # Register the results (saves DF to results_store dict and to a CSV file)
+# # The results_store dictionary should already exist from a previous cell.
+# register_results("Lasso_TimeRoll_ResidRow", wf_lasso_time_res)
+
+# # Print head of Lasso results DataFrame
+# if wf_lasso_time_res is not None and not wf_lasso_time_res.empty:
+#     print("\n[INFO] wf_lasso_time_res (head of results):")
+#     print(wf_lasso_time_res.head())
+# else:
+#     print("[INFO] No results generated for Lasso.")
+# print("="*50)
+
+# %% [markdown]
+#
