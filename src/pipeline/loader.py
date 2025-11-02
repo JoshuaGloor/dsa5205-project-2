@@ -75,7 +75,7 @@ class DataLoader:
                 axis=1,
             )
         )
-        return Self
+        return self
 
     def _add_field_col_op(self, field: str, base_field: str, func: Callable) -> Self:
         """Add a new column to raw MultiIndex with transformation on col level.
@@ -96,7 +96,7 @@ class DataLoader:
                 axis=1,
             )
         )
-        return Self
+        return self
 
     def _fsplit(self) -> Self:
         r"""Add $f_t^{split}$ to each ticker."""
@@ -108,20 +108,22 @@ class DataLoader:
         r"""Add $f_t^{div}$ to each ticker."""
 
         # Previous day's close per ticker
-        self._add_field_col_op("prev_close", "close", lambda t: t.shift(1))
+        # TODO Is this wrong or not?
+        # self._add_field_col_op("prev_close", "close", lambda t: t.shift(1))
 
         # Dividends per ticker, fill missing with 0
         self._add_field_col_op("div_clean", "dividends", lambda t: t.fillna(0.0))
 
         # Dividend adjustment factor f_div
-        f_div = 1.0 / (1.0 + (self.raw["div_clean"] / self.raw["prev_close"]))
+        # f_div = 1.0 / (1.0 + (self.raw["div_clean"] / self.raw["prev_close"]))
+        f_div = 1.0 / (1.0 + (self.raw["div_clean"] / self.raw["close"]))
         # Add new column back to MultiIndex
         f_div.columns = pd.MultiIndex.from_product([["f_div"], f_div.columns])
         self.raw = self.raw.join(f_div)
 
         # Drop helper columns
-        # self.raw.drop(columns="prev_close", level=0)
-        # self.raw.drop(columns="div_clean", level=0)
+        # self.raw = self.raw.drop(columns="prev_close", level=0)
+        # self.raw = self.raw.drop(columns="div_clean", level=0)
 
         return self
 
@@ -146,7 +148,19 @@ class DataLoader:
         if "gt" not in self.raw.columns.get_level_values(0):
             raise MethodChainError(f"'gt' must exist before creating 'cum_gt'")
 
-        self._add_field_col_op("cum_gt", "gt", lambda t: t[::-1].cumprod()[::-1])
+        # This cum product gives us product k >= t (greater equal, qe), we have to adjust to k > t later
+        self._add_field_col_op("cum_gt_qe", "gt", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
+
+        # Adjust to k > t
+        cum_gt = self.raw["cum_gt_qe"] / self.raw["gt"]
+
+        # Add new column back to MultiIndex
+        cum_gt.columns = pd.MultiIndex.from_product([["cum_gt"], cum_gt.columns])
+        self.raw = self.raw.join(cum_gt)
+
+        # Drop helper column
+        self.raw = self.raw.drop(columns="cum_gt_qe", level=0)
+
         return self
 
     def _adj(self):
@@ -156,7 +170,8 @@ class DataLoader:
             raise MethodChainError(f"'cum_gt' must exist before creating 'adj_close_manual'")
 
         # Calculate adj_close_manual
-        adj = self.raw["close"] * self.raw["cum_gt"].shift(1)
+        adj = self.raw["close"] * self.raw["cum_gt"]
+
         # Add new column back to MultiIndex
         adj.columns = pd.MultiIndex.from_product([["adj_close_manual"], adj.columns])
         self.raw = self.raw.join(adj)
