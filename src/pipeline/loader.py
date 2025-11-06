@@ -26,13 +26,13 @@ class DataLoader:
     end: str | None = None  # "yyyy-mm-dd" or None, which will return up to latest data available.
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2))
-    def _fetch_tickers(self, auto_adjust=True) -> pd.DataFrame:
+    def _fetch_tickers(self, adjusted=True) -> pd.DataFrame:
         df = yf.download(
             self.tickers,
             start=self.start,
             end=self.end,
-            auto_adjust=auto_adjust,
-            actions=not auto_adjust,
+            auto_adjust=adjusted,
+            actions=not adjusted,
             progress=False,
         )
 
@@ -40,8 +40,12 @@ class DataLoader:
             raise NoDataError(f"No data returned for ticker list {self.tickers}")
 
         df.columns = df.columns.set_names(["Field", "Ticker"])
+
         # Rename fields to lower and replace whitespace with und underscore
         df.columns = df.columns.map(lambda t: (t[0].lower().replace(" ", "_"), t[1]))
+
+        # We don't need high and low
+        df = df.drop(columns=["high", "low"], level=0)
         return df
 
     def fetch_data(self) -> Self:
@@ -51,15 +55,18 @@ class DataLoader:
         adjusted and raw columns in one call, we keep them separate as suggested in the exercise sheet.
         """
 
-        self.raw = self._fetch_tickers(auto_adjust=False)
-        self.adj = self._fetch_tickers(auto_adjust=True)
+        self.raw = self._fetch_tickers(adjusted=False)
+        # Drop adj close, we do not need it.
+        self.raw = self.raw.drop(columns="adj_close", level=0)
+
+        self.adj = self._fetch_tickers(adjusted=True)
         return self
 
     def _add_field_row_op(self, field: str, base_field: str, func: Callable) -> Self:
         """Add a new column to raw MultiIndex with transformation on row level.
 
         This helper adds the new field 'field' to the MultiIndex.
-        The 'func' is applied to each *row*.
+        The 'func' is a function that operatates on *rows*.
 
         Examples:
         - shift over time -> column level (this is the wrong function)
@@ -81,7 +88,7 @@ class DataLoader:
         """Add a new column to raw MultiIndex with transformation on col level.
 
         This helper adds the new field 'field' to the MultiIndex.
-        The 'func' is applied to each *col*.
+        The 'func' is a function that operates on *cols*.
 
         Examples:
         - shift over time -> column level (this is the correct function)
@@ -101,29 +108,34 @@ class DataLoader:
     def _fsplit(self) -> Self:
         r"""Add $f_t^{split}$ to each ticker."""
 
-        self._add_field_row_op("f_split", "stock_splits", lambda s_t: np.where(s_t.fillna(0) != 0, 1 / s_t, 1.0))
+        # See e.g. this discussion: https://github.com/ranaroussi/yfinance/discussions/1682
+        if "Daily closing price is split adjusted already, Yahoo does not provide non-split adjusted prices!":
+            # We want to preserve the rest of the logic of how it could be done if we had non-split adjusted data.
+            self._add_field_row_op("f_split", "stock_splits", lambda _: 1)  # Dummy column of ones.
+        else:  # We would execute this if we had true unadjusted prices.
+            self._add_field_row_op("f_split", "stock_splits", lambda s_t: np.where(s_t.fillna(0) != 0, 1 / s_t, 1.0))
         return self
 
     def _fdiv(self) -> Self:
         r"""Add $f_t^{div}$ to each ticker."""
 
         # Previous day's close per ticker
-        # TODO Is this wrong or not?
-        # self._add_field_col_op("prev_close", "close", lambda t: t.shift(1))
+        self._add_field_col_op("prev_close", "close", lambda t: t.shift(1))
 
         # Dividends per ticker, fill missing with 0
         self._add_field_col_op("div_clean", "dividends", lambda t: t.fillna(0.0))
 
-        # Dividend adjustment factor f_div
-        # f_div = 1.0 / (1.0 + (self.raw["div_clean"] / self.raw["prev_close"]))
-        f_div = 1.0 / (1.0 + (self.raw["div_clean"] / self.raw["close"]))
+        # Dividend adjustment factor f_div = P_{t - 1} / (P_{t - 1} + D_t)
+        # f_div = self.raw["prev_close"] / (self.raw["prev_close"] + self.raw["div_clean"])
+        f_div = self.raw["close"] / (self.raw["close"] + self.raw["div_clean"])
+
         # Add new column back to MultiIndex
         f_div.columns = pd.MultiIndex.from_product([["f_div"], f_div.columns])
         self.raw = self.raw.join(f_div)
 
         # Drop helper columns
-        # self.raw = self.raw.drop(columns="prev_close", level=0)
-        # self.raw = self.raw.drop(columns="div_clean", level=0)
+        self.raw = self.raw.drop(columns="prev_close", level=0)
+        self.raw = self.raw.drop(columns="div_clean", level=0)
 
         return self
 
@@ -136,6 +148,7 @@ class DataLoader:
 
         # Calculate g_t
         gt = self.raw["f_split"] * self.raw["f_div"]
+
         # Add new column back to MultiIndex
         gt.columns = pd.MultiIndex.from_product([["gt"], gt.columns])
         self.raw = self.raw.join(gt)
@@ -178,7 +191,7 @@ class DataLoader:
 
         return self
 
-    def verify_data(self):
+    def verify_data(self) -> pd.DataFrame:
         """Constructs and verifies back adjustment.
 
         Follows recommendations given in Appendix B of exercise sheet.
@@ -189,3 +202,9 @@ class DataLoader:
 
         # Compute back adjusted total return
         self._fsplit()._fdiv()._gt()._cum_gt()._adj()
+
+        # Calculate mean absolute difference (MAD) between our adj close and Yahoo's
+        abs_diff = (self.raw["adj_close_manual"] - self.adj["close"]).abs()
+        mad = abs_diff.mean()
+
+        return pd.DataFrame(mad, columns=["mean_abs_diff"]).T
