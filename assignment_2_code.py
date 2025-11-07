@@ -511,8 +511,26 @@ def apply_resid_slice(df_slice: pd.DataFrame,
 
     return pd.DataFrame(out_cols, index=df_slice.index)
 
-# Step 5: Simple Forward Validation (Fixed Train/Val/Test) for Ridge with Residualized Features
-def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID):
+
+# -----------------------------
+# Ridge (FixedFWD, Resid) block
+# -----------------------------
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
+import numpy as np
+import pandas as pd
+
+def _alpha_grid_fallback():
+    # Prefer a Ridge-specific grid if present; otherwise fall back cleanly.
+    if 'ALPHA_GRID_RIDGE' in globals():
+        return globals()['ALPHA_GRID_RIDGE']
+    if 'ALPHA_GRID' in globals():
+        return globals()['ALPHA_GRID']
+    return np.logspace(-4, 2, 13)  # sane default
+
+def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=None):
     """
     Simple forward validation:
       - Fit a Ridge model for each alpha on TRAIN (residualized features).
@@ -520,6 +538,9 @@ def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID
       - Refit a new model on combined (TRAIN + VALIDATION) using that alpha.
     Returns: best_alpha, final_pipeline, common_features_used
     """
+    if alphas is None:
+        alphas = _alpha_grid_fallback()
+
     best_alpha, best_mse = None, np.inf
 
     # Common features between train and val
@@ -541,7 +562,7 @@ def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID
     for a in alphas:
         pipe = Pipeline([
             ("scaler", StandardScaler(with_mean=True, with_std=True)),
-            ("ridge",  Ridge(alpha=a, random_state=42))
+            ("ridge",  Ridge(alpha=a, fit_intercept=True, random_state=42))
         ])
         try:
             pipe.fit(Xtr_fit, ytr_fit)                 # scaler fit ONLY on train
@@ -562,7 +583,7 @@ def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID
 
     final_pipe = Pipeline([
         ("scaler", StandardScaler(with_mean=True, with_std=True)),
-        ("ridge",  Ridge(alpha=best_alpha, random_state=42))
+        ("ridge",  Ridge(alpha=best_alpha, fit_intercept=True, random_state=42))
     ])
 
     final_fit_df = X_tv_res.join(y_tv).dropna()
@@ -579,8 +600,7 @@ def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID
     return best_alpha, final_pipe, common_features
 
 
-# Simple forward-validation evaluation (keeps original function name/signature for compatibility)
-def walk_forward_ridge_all_features_time_resid_row(
+def ridge_fixedfwd_resid_eval(
     X_y: pd.DataFrame,
     feature_cols=FEATURE_COLS,   # raw feature cols in X_y
     label_col=LABEL_COL,
@@ -589,40 +609,34 @@ def walk_forward_ridge_all_features_time_resid_row(
     train_offset=TRAIN_OFFSET,
     val_offset=VAL_OFFSET,
     test_offset=TEST_OFFSET,
-    predict_step=PREDICT_STEP,   # unused in simple validation
-    alphas=ALPHA_GRID,
-    cost_one_way=ONE_WAY
+    cost_one_way=ONE_WAY,
+    alphas=None
 ):
     """
-    SIMPLE FORWARD VALIDATION VERSION:
-      - Use one fixed Train / Val / Test split (like the Elastic Net block).
-      - Residualize once using betas from TRAIN (via calculate_betas / apply_resid_slice).
-      - Tune alpha on Train→Val, refit on Train+Val, evaluate once on Test.
+    Fixed Forward Validation (aligns with other models):
+      - Use one fixed Train / Val / Test split.
+      - Residualize once using betas from TRAIN.
+      - Tune alpha on Train→Val, refit on Train+Val, evaluate on Test.
       - Returns a DataFrame indexed by test dates with columns:
             ['y_hat','y_real','alpha','signal','signal_prev','cost','pnl']
     """
+    # ---- 0) Build fixed splits (same logic as others) ----
+    dates = X_y.index
+    first_train_start = dates.min()
+    train_end_date = first_train_start + train_offset - pd.Timedelta(days=1)
+    val_end_date   = train_end_date + val_offset
+    test_end_date  = val_end_date + test_offset
 
-    # ---- 0) Build / reuse fixed splits (same logic as ENet block) ----
-    if 'train_df_raw' not in locals() or 'val_df_raw' not in locals() or 'test_df_raw' not in locals():
-        print("[INFO] Defining fixed time splits for Ridge (simple forward validation)...")
-        dates = X_y.index
-        first_train_start = dates.min()
-        train_end_date = first_train_start + train_offset - pd.Timedelta(days=1)
-        val_end_date   = train_end_date + val_offset
-        test_end_date  = val_end_date + test_offset
+    train_df_raw = X_y.loc[first_train_start : train_end_date]
+    val_df_raw   = X_y.loc[train_end_date + pd.Timedelta(days=1) : val_end_date]
+    test_df_raw  = X_y.loc[val_end_date   + pd.Timedelta(days=1) : test_end_date]
 
-        train_df_raw = X_y.loc[first_train_start : train_end_date]
-        val_df_raw   = X_y.loc[train_end_date + pd.Timedelta(days=1) : val_end_date]
-        test_df_raw  = X_y.loc[val_end_date   + pd.Timedelta(days=1) : test_end_date]
+    print(f"[INFO] Fixed Splits | Train: {train_df_raw.index.min().date()} to {train_df_raw.index.max().date()} ({len(train_df_raw)} days)")
+    print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()}   to {val_df_raw.index.max().date()}   ({len(val_df_raw)} days)")
+    print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()}  to {test_df_raw.index.max().date()}  ({len(test_df_raw)} days)")
 
-        print(f"[INFO] Fixed Splits | Train: {train_df_raw.index.min().date()} to {train_df_raw.index.max().date()} ({len(train_df_raw)} days)")
-        print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()}   to {val_df_raw.index.max().date()}   ({len(val_df_raw)} days)")
-        print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()}  to {test_df_raw.index.max().date()}  ({len(test_df_raw)} days)")
-
-        if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
-            raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
-    else:
-        print("[INFO] Using existing fixed time splits.")
+    if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+        raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
 
     # ---- 1) Residualization betas from TRAIN and apply to all splits ----
     print("[INFO] Calculating residualization betas on fixed training set (Ridge)...")
@@ -639,14 +653,14 @@ def walk_forward_ridge_all_features_time_resid_row(
         resid_feature_cols.append(ctrl_col)
     resid_feature_cols += [p + "_res" for p in peers_list]
 
-    # bring in style features that you added in Step 2.5
-    style_candidates = ['nvda_vol5', 'nvda_mom1', 'nvda_mom5', 'nvda_log_dvol']  
-    style_cols = [c for c in style_candidates if c in feature_cols and c in train_df_raw.columns] 
+    # bring in style features if present
+    style_candidates = ['nvda_vol5', 'nvda_mom1', 'nvda_mom5', 'nvda_log_dvol']
+    style_cols = [c for c in style_candidates if c in feature_cols and c in train_df_raw.columns]
 
     # build FULL design matrices = [residualized peers (+ctrl)] ⨁ [style features]
-    X_train_full = pd.concat([X_train_res[resid_feature_cols], train_df_raw[style_cols]], axis=1)  
-    X_val_full   = pd.concat([X_val_res[resid_feature_cols],   val_df_raw[style_cols]],   axis=1)  
-    X_test_full  = pd.concat([X_test_res[resid_feature_cols],  test_df_raw[style_cols]],  axis=1) 
+    X_train_full = pd.concat([X_train_res[resid_feature_cols], train_df_raw[style_cols]], axis=1)
+    X_val_full   = pd.concat([X_val_res[resid_feature_cols],   val_df_raw[style_cols]],   axis=1)
+    X_test_full  = pd.concat([X_test_res[resid_feature_cols],  test_df_raw[style_cols]],  axis=1)
 
     # Targets
     y_train = train_df_raw[label_col]
@@ -661,16 +675,15 @@ def walk_forward_ridge_all_features_time_resid_row(
         print("[ERROR] Final Ridge model could not be trained. Returning empty results.")
         return pd.DataFrame(columns=["y_hat","y_real","alpha","signal","signal_prev","cost","pnl"])
 
-    print(f"[INFO] Best Ridge alpha (simple validation): {best_alpha:.6f}")
+    print(f"[INFO] Best Ridge alpha (FixedFWD): {best_alpha:.6f}")
 
     # Determine the exact feature order the model expects
     try:
         model_features = list(final_model.feature_names_in_)   # sklearn >= 1.0
     except AttributeError:
-        model_features = list(common_features)                 # fallback to what we trained on
+        model_features = list(common_features)                 # fallback
 
-    # ---- 3) Predict on TEST and compute PnL (cost_one_way can be set to 0 upstream) ----
-    # Keep ONLY the model features, IN THE SAME ORDER
+    # ---- 3) Predict on TEST and compute PnL ----
     X_test_predict = X_test_full.reindex(columns=model_features)
     test_pred_df = X_test_predict.join(y_test.rename('y_real')).dropna()
     if test_pred_df.empty:
@@ -679,35 +692,36 @@ def walk_forward_ridge_all_features_time_resid_row(
 
     # Predictions
     y_hat_test = pd.Series(final_model.predict(test_pred_df[model_features]),
-                        index=test_pred_df.index, name='y_hat')
+                           index=test_pred_df.index, name='y_hat')
 
     out = test_pred_df[['y_real']].copy()
     out['y_hat'] = y_hat_test
     out['alpha'] = best_alpha
     out['signal'] = np.where(out['y_hat'] > 0, 1, np.where(out['y_hat'] < 0, -1, 0))
     out['signal_prev'] = out['signal'].shift(1).fillna(0)
-    legs = (out['signal'] - out['signal_prev']).abs()
+    legs = (out['signal_prev'] - out['signal_prev'].shift(1).fillna(0)).abs()
     out['cost'] = legs * cost_one_way
-    out['pnl']  = out['signal'] * out['y_real'] - out['cost']
+    out['pnl']  = out['signal_prev'] * out['y_real'] - out['cost']
 
     out = out[['y_hat','y_real','alpha','signal','signal_prev','cost','pnl']]
     out.index.name = "date"
     return out
 
-# Execute the SIMPLE FORWARD VALIDATION evaluation for Ridge (keeps original printouts)
+
+# Execute the FixedFWD evaluation for Ridge and register with unified key
 print("\n" + "="*50)
-print("Executing SIMPLE FORWARD VALIDATION (Ridge, Residualized Features)")
+print("Executing Ridge (FixedFWD, Residualized Features)")
 print("="*50)
-wf_ridge_all_time_res_row = walk_forward_ridge_all_features_time_resid_row(X_y)
-print("\n[INFO] wf_ridge_all_time_res_row (head of results):")
-if not wf_ridge_all_time_res_row.empty:
-    print(wf_ridge_all_time_res_row.head())
+ridge_fixedfwd_resid_df = ridge_fixedfwd_resid_eval(X_y)
+print("\n[INFO] Ridge_FixedFWD_Resid (head of results):")
+if not ridge_fixedfwd_resid_df.empty:
+    print(ridge_fixedfwd_resid_df.head())
 else:
     print("[INFO] No results generated.")
 print("="*50)
 
-# Register the results (same key as before to avoid changing downstream code)
-register_results("Ridge_TimeRoll_ResidRow", wf_ridge_all_time_res_row)
+# Register the results with the same naming convention as other models
+register_results("Ridge_FixedFWD_Resid", ridge_fixedfwd_resid_df)
 
 
 # %%
@@ -720,61 +734,53 @@ print("="*40)
 results_summary = summarize_results(results_store)
 if results_summary is not None and not results_summary.empty:
     print("\nSummary Statistics Table:")
-    # Display more precision in the summary table
     with pd.option_context('display.float_format', '{:,.4f}'.format):
         print(results_summary)
 else:
-     print("No model results available to summarize.")
+    print("No model results available to summarize.")
 print("="*40)
 
 # --- Plotting Results ---
-# Plot only models present in the results_store
 if results_store:
     plt.figure(figsize=(14, 8))
     plot_count = 0
-    
+
     # Plot strategy cumulative returns
     for name, df in results_store.items():
         if df is not None and not df.empty and 'pnl' in df.columns:
-            # Add cumulative PnL column if not already added by evaluate_model_results
             if 'cum_pnl' not in df.columns:
-                 df['cum_pnl'] = (1 + df['pnl'].fillna(0)).cumprod() - 1
+                df['cum_pnl'] = (1 + df['pnl'].fillna(0)).cumprod() - 1
 
-            # Ensure data is available for plotting
             if not df['cum_pnl'].isna().all():
-                 plt.plot(df.index, df['cum_pnl'], label=f"{name} (Net)")
-                 plot_count += 1
+                plt.plot(df.index, df['cum_pnl'], label=f"{name} (Net)")
+                plot_count += 1
             else:
-                 print(f"[INFO] Skipping plot for {name} - cumulative PnL is all NaN.")
+                print(f"[INFO] Skipping plot for {name} - cumulative PnL is all NaN.")
 
     # Add Buy & Hold NVDA Close-to-Open benchmark from a representative run
     bh_df_source = None
     bh_col_name = 'cum_bh'
-    # Find a valid results df to source the benchmark y_real
     for name, df in results_store.items():
         if df is not None and not df.empty and 'y_real' in df.columns:
-            bh_df_source = df.copy() # Use this df's index and y_real
+            bh_df_source = df.copy()
             bh_df_source[bh_col_name] = (1 + bh_df_source['y_real'].fillna(0)).cumprod() - 1
-            break # Use the first valid one
+            break
 
     if bh_df_source is not None and not bh_df_source[bh_col_name].isna().all():
-         plt.plot(bh_df_source.index, bh_df_source[bh_col_name], label='BH NVDA CO', linestyle='--', color='black')
-         plot_count += 1
+        plt.plot(bh_df_source.index, bh_df_source[bh_col_name], label='BH NVDA CO', linestyle='--', color='black')
+        plot_count += 1
     else:
-         print("[WARN] Could not plot Buy & Hold NVDA (CO) benchmark.")
+        print("[WARN] Could not plot Buy & Hold NVDA (CO) benchmark.")
 
     if plot_count > 0:
-        # Determine overall date range for title
-        # Correctly find min/max dates across all valid DataFrame indices
         all_min_dates = [df.index.min() for df in results_store.values() if df is not None and not df.empty]
         all_max_dates = [df.index.max() for df in results_store.values() if df is not None and not df.empty]
-        
+
         if all_min_dates and all_max_dates:
-             min_date_str = min(all_min_dates).date()
-             max_date_str = max(all_max_dates).date()
-             plt.title(f"Cumulative PnL Comparison (Test Periods ending {max_date_str})")
+            max_date_str = max(all_max_dates).date()
+            plt.title(f"Cumulative PnL Comparison (Test Periods ending {max_date_str})")
         else:
-             plt.title("Cumulative PnL Comparison")
+            plt.title("Cumulative PnL Comparison")
 
         plt.xlabel("Date")
         plt.ylabel("Cumulative Return")
@@ -784,23 +790,18 @@ if results_store:
     else:
         print("[INFO] No valid model results found to plot.")
 
-    # Plot alpha chosen over time for the Ridge model run
-    if "Ridge_TimeRoll_ResidRow" in results_store:
-         ridge_df = results_store["Ridge_TimeRoll_ResidRow"]
-         if 'alpha' in ridge_df.columns and not ridge_df['alpha'].isna().all():
-              plt.figure(figsize=(14, 5))
-              plt.plot(ridge_df.index, ridge_df['alpha'], marker='.', linestyle='None', label='Chosen Alpha')
-              plt.yscale('log') # Use log scale for alpha
-              plt.title("Ridge Alpha Chosen Over Time (Log Scale)")
-              plt.xlabel("Date")
-              plt.ylabel("Alpha (log scale)")
-              plt.grid(True)
-              plt.show()
-         else:
-              print("[INFO] Alpha column not available or empty for Ridge model.")
+    # Ridge alpha (FixedFWD): constant over test; show as text if present
+    if "Ridge_FixedFWD_Resid" in results_store:
+        ridge_df = results_store["Ridge_FixedFWD_Resid"]
+        if 'alpha' in ridge_df.columns and not ridge_df['alpha'].dropna().empty:
+            alpha_val = ridge_df['alpha'].dropna().iloc[0]
+            print(f"[INFO] Ridge_FixedFWD_Resid best alpha (FixedFWD): {alpha_val:.6g}")
+        else:
+            print("[INFO] Alpha column not available or empty for Ridge model.")
 
 else:
     print("[INFO] results_store is empty. Nothing to plot.")
+
 
 # %% [markdown]
 # In evaluating the performance of our daily trading strategies, we utilize specific Buy-and-Hold (BH) benchmarks designed to directly correspond to the strategies' intended holding periods, rather than a simple long-term investment "buy and hold forever" approach. This decision allows for a fairer assessment of the timing value added by the models, instead of comparing it to some investment. 
