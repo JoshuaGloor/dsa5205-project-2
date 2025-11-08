@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Self, Callable, Sequence
+from typing import Self, Callable
 
 import pandas as pd
 import numpy as np
@@ -27,12 +27,23 @@ class DataLoader:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2))
     def _fetch_tickers(self, adjusted=True) -> pd.DataFrame:
+        """Retrieve data for all tickers.
+
+        Returns a MultiIndex data frame with index level names ["Field", "Ticker"].
+
+        With adjusted=True the df has the following fields:
+        ["adj_close", "close", "dividends", "high", "low", "open", "stock_splits", "volume"]
+
+        With adjusted=False the df has the following fields:
+        ["close", "high", "low", "open", "volume"]
+        """
+
         df = yf.download(
             self.tickers,
             start=self.start,
             end=self.end,
             auto_adjust=adjusted,
-            actions=not adjusted,
+            actions=not adjusted,  # Only need dividend and split data if close is not auto adjusted.
             progress=False,
         )
 
@@ -44,21 +55,16 @@ class DataLoader:
         # Rename fields to lower and replace whitespace with und underscore
         df.columns = df.columns.map(lambda t: (t[0].lower().replace(" ", "_"), t[1]))
 
-        # We don't need high and low
-        df = df.drop(columns=["high", "low"], level=0)
         return df
 
     def fetch_data(self) -> Self:
         """Helper to fetch raw and adj data.
 
-        While the yfinance API with actions=True and auto_adjust=True returns both
-        adjusted and raw columns in one call, we keep them separate as suggested in the exercise sheet.
+        We fetch twice because yfinance's download method also auto adjusts
+        open, high, and low, not only the closing price.
         """
 
         self.raw = self._fetch_tickers(adjusted=False)
-        # Drop adj close, we do not need it.
-        self.raw = self.raw.drop(columns="adj_close", level=0)
-
         self.adj = self._fetch_tickers(adjusted=True)
         return self
 
@@ -66,11 +72,11 @@ class DataLoader:
         """Add a new column to raw MultiIndex with transformation on row level.
 
         This helper adds the new field 'field' to the MultiIndex.
-        The 'func' is a function that operatates on *rows*.
+        The 'func' is a function that operatates on *rows* of the 'base_field' column.
 
         Examples:
-        - shift over time -> column level (this is the wrong function)
-        - transform each row -> row level (this is the correct function)
+        - shift over time => column level (this is the wrong function)
+        - transform each row => row level (this is the correct function)
         """
 
         self.raw = self.raw.join(
@@ -125,13 +131,16 @@ class DataLoader:
         # Dividends per ticker, fill missing with 0
         self._add_field_col_op("div_clean", "dividends", lambda t: t.fillna(0.0))
 
-        # Dividend adjustment factor f_div = P_{t - 1} / (P_{t - 1} + D_t)
-        # f_div = self.raw["prev_close"] / (self.raw["prev_close"] + self.raw["div_clean"])
-        f_div = self.raw["close"] / (self.raw["close"] + self.raw["div_clean"])
+        # Dividend adjustment factor f_div = 1 / (1 + D_t / P_{t - 1}) = P_{t - 1} / (P_{t - 1} + D_t)
+        f_div = self.raw["prev_close"] / (self.raw["prev_close"] + self.raw["div_clean"])
 
-        # Add new column back to MultiIndex
+        # Yahoo uses an approximation: f_div_yahoo = 1 - D_t / P_{t - 1}
+        f_div_yahoo = 1 - self.raw["div_clean"] / self.raw["prev_close"]
+
+        # Add new columns back to MultiIndex
         f_div.columns = pd.MultiIndex.from_product([["f_div"], f_div.columns])
-        self.raw = self.raw.join(f_div)
+        f_div_yahoo.columns = pd.MultiIndex.from_product([["f_div_yahoo"], f_div_yahoo.columns])
+        self.raw = self.raw.join([f_div, f_div_yahoo])
 
         # Drop helper columns
         self.raw = self.raw.drop(columns="prev_close", level=0)
@@ -148,10 +157,12 @@ class DataLoader:
 
         # Calculate g_t
         gt = self.raw["f_split"] * self.raw["f_div"]
+        gt_yahoo = self.raw["f_split"] * self.raw["f_div_yahoo"]
 
-        # Add new column back to MultiIndex
+        # Add new columns back to MultiIndex
         gt.columns = pd.MultiIndex.from_product([["gt"], gt.columns])
-        self.raw = self.raw.join(gt)
+        gt_yahoo.columns = pd.MultiIndex.from_product([["gt_yahoo"], gt_yahoo.columns])
+        self.raw = self.raw.join([gt, gt_yahoo])
 
         return self
 
@@ -163,16 +174,20 @@ class DataLoader:
 
         # This cum product gives us product k >= t (greater equal, qe), we have to adjust to k > t later
         self._add_field_col_op("cum_gt_qe", "gt", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
+        self._add_field_col_op("cum_gt_yahoo_qe", "gt_yahoo", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
 
         # Adjust to k > t
         cum_gt = self.raw["cum_gt_qe"] / self.raw["gt"]
+        cum_gt_yahoo = self.raw["cum_gt_yahoo_qe"] / self.raw["gt_yahoo"]
 
-        # Add new column back to MultiIndex
+        # Add new columns back to MultiIndex
         cum_gt.columns = pd.MultiIndex.from_product([["cum_gt"], cum_gt.columns])
-        self.raw = self.raw.join(cum_gt)
+        cum_gt_yahoo.columns = pd.MultiIndex.from_product([["cum_gt_yahoo"], cum_gt_yahoo.columns])
+        self.raw = self.raw.join([cum_gt, cum_gt_yahoo])
 
-        # Drop helper column
+        # Drop helper columns
         self.raw = self.raw.drop(columns="cum_gt_qe", level=0)
+        self.raw = self.raw.drop(columns="cum_gt_yahoo_qe", level=0)
 
         return self
 
@@ -182,12 +197,14 @@ class DataLoader:
         if "cum_gt" not in self.raw.columns.get_level_values(0):
             raise MethodChainError(f"'cum_gt' must exist before creating 'adj_close_manual'")
 
-        # Calculate adj_close_manual
+        # Calculate adjusted close
         adj = self.raw["close"] * self.raw["cum_gt"]
+        adj_yahoo = self.raw["close"] * self.raw["cum_gt_yahoo"]
 
         # Add new column back to MultiIndex
         adj.columns = pd.MultiIndex.from_product([["adj_close_manual"], adj.columns])
-        self.raw = self.raw.join(adj)
+        adj_yahoo.columns = pd.MultiIndex.from_product([["adj_close_yahoo"], adj_yahoo.columns])
+        self.raw = self.raw.join([adj, adj_yahoo])
 
         return self
 
@@ -203,8 +220,12 @@ class DataLoader:
         # Compute back adjusted total return
         self._fsplit()._fdiv()._gt()._cum_gt()._adj()
 
-        # Calculate mean absolute difference (MAD) between our adj close and Yahoo's
+        # Calculate mean absolute difference (MAD) between our adj close and Yahoo's.
         abs_diff = (self.raw["adj_close_manual"] - self.adj["close"]).abs()
         mad = abs_diff.mean()
 
-        return pd.DataFrame(mad, columns=["mean_abs_diff"]).T
+        # Calculate MAD of our calculation with Yahoo's approximation.
+        abs_diff_yahoo = (self.raw["adj_close_yahoo"] - self.adj["close"]).abs()
+        mad_yahoo = abs_diff_yahoo.mean()
+
+        return pd.DataFrame([mad, mad_yahoo], index=["mean_abs_diff_yahoo_and_ours", "mean_abs_diff_yahoo_approx"]).T
