@@ -79,7 +79,7 @@ class DataLoader:
         self.adj = self._fetch_tickers(adjusted=True)
         return self
 
-    def adjust_data(self) -> Self:
+    def adjust_data(self) -> None:
         r"""Execute the full price-adjustment pipeline for all tickers.
 
         This method sequentially applies the adjustment stages required to
@@ -92,22 +92,16 @@ class DataLoader:
             3. `_gt()`     : combines both into the total adjustment factor $g_t$
             4. `_cum_gt()` : computes the cumulative product $\prod_{k > t} g_k$
             5. `_adj()`    : constructs the back-adjusted OHLC price $A_t = P_t \cdot \prod_{k > t} g_k$
-
-        Returns
-        -------
-        Self
-            The same instance, with adjusted data added to `self.raw`.
         """
 
-        if self._state != State.FETCH:
+        if self._state != State.FETCHED:
             raise RuntimeError("Data is not fetched yet, call `fetch_data` first.")
         self._state = State.ADJUSTED
 
         # Pipeline to adjust data
         self._fsplit()._fdiv()._gt()._cum_gt()._adj()
-        return self
 
-    def get_adjusted_data(self, source="true") -> pd.DataFrame:
+    def get_adjusted_data(self, source="true") -> tuple[pd.DataFrame]:
         """Return adjusted OHLCV data for all tickers.
 
         This method provides access to adjusted price data based on the specified
@@ -188,70 +182,15 @@ class DataLoader:
         if self._state != State.ADJUSTED:
             raise RuntimeError("Data is not adjusted yet, call `adjust_data` first.")
 
-        true = self.get_adjusted_data("true")
-        yahoo = self.get_adjusted_data("yahoo")
-        manual = self.get_adjusted_data("manual")
-
-        # Calculate mean absolute difference (MAD) between our adj close and Yahoo's.
-        # This shows the difference between Yahoo's approximated dividend adjustement factor and the true one.
-        yahoo_true_diff = (yahoo["close"] - true["close"]).abs()
-        mad_yahoo_true = yahoo_true_diff.mean()
-
-        # Calculate mean absolute difference (MAD) between manual recalculation of Yahoo's data and Yahoo's.
-        # This is expected to be machine precision.
-        yahoo_manual_diff = (yahoo["close"] - manual["close"]).abs()
-        mad_yahoo_manual = yahoo_manual_diff.mean()
-
-        df_mad = pd.DataFrame(
-            [mad_yahoo_true, mad_yahoo_manual], index=["MAD Yahoo and True", "MAD Yahoo and Manual Recomputation"]
-        ).T
-
-        # We assume NVDA is part of the tickers it had both dividends as well as splits.
-        try:
-    def verify_data(self) -> pd.DataFrame:
-        """Verify correctness of the back-adjusted price construction.
-
-        This method compares the adjusted closing prices obtained from different
-        adjustment sources and reports the mean absolute differences (MAD) between them.
-
-        Specifically, two comparisons are performed:
-
-        1. **Yahoo vs. true:**
-           Compares Yahoo's approximate dividend-adjustment logic with the
-           internally computed "true" adjustment factors. The resulting MAD
-           quantifies the approximation error introduced by Yahoo's method.
-
-        2. **Yahoo vs. manual recomputation:**
-           Compares Yahoo's adjusted prices with a manual recomputation based on
-           Yahoo's logic. The resulting MAD should be at or near machine precision.
-
-        Returns
-        -------
-        pd.DataFrame
-            DataFrame summarizing mean absolute differences (MAD) between
-            adjusted close prices from different sources for each ticker. Columns include:
-
-            - `"MAD Yahoo and True"`: Mean absolute difference between Yahoo's and true adjustment logic.
-            - `"MAD Yahoo and Manual Recomputation"`: Mean absolute difference between
-              Yahoo's adjusted prices and a manual recomputation of them.
-        """
-
-        if self._state != State.ADJUSTED:
-            raise RuntimeError("Data is not adjusted yet, call `adjust_data` first.")
-
-        true = self.get_adjusted_data("true")
-        yahoo = self.get_adjusted_data("yahoo")
-        manual = self.get_adjusted_data("manual")
-
         # ---------- Mean absolute difference checks ---------- #
         # Calculate mean absolute difference (MAD) between our adj close and Yahoo's.
         # This shows the difference between Yahoo's approximated dividend adjustement factor and the true one.
-        yahoo_true_diff = (yahoo["close"] - true["close"]).abs()
+        yahoo_true_diff = (self.adj["close"] - self.raw["adj_close_true"]).abs()
         mad_yahoo_true = yahoo_true_diff.mean()
 
         # Calculate mean absolute difference (MAD) between manual recalculation of Yahoo's data and Yahoo's.
         # This is expected to be machine precision.
-        yahoo_manual_diff = (yahoo["close"] - manual["close"]).abs()
+        yahoo_manual_diff = (self.adj["close"] - self.raw["adj_close_manual"]).abs()
         mad_yahoo_manual = yahoo_manual_diff.mean()
 
         df_mad = pd.DataFrame(
@@ -259,8 +198,104 @@ class DataLoader:
         ).T
 
         # ---------- Event alignment checks ---------- #
-        # TOOD
-        return df_mad
+        # Choose ticker for event inspection.
+        # We choose NVDA if it is part of the tickers because it is our focus and it had both dividends and splits.
+        tickers = self.raw["close"].columns
+        if "NVDA" in tickers:
+            ticker = "NVDA"
+        else:
+            ticker = tickers[0]
+
+        # Extract per-ticker series.
+        close_true = self.raw["adj_close_true"].xs(ticker, axis=1, level=1)
+        close_yahoo = self.adj["close"].xs(ticker, axis=1, level=1)
+        close_manual = self.raw["adj_close_manual"].xs(ticker, axis=1, level=1)
+
+        # Extract interesting columns.
+        f_split = self.raw["f_split"].xs(ticker, axis=1, level=1)
+        f_div_true = self.raw["f_div"].xs(ticker, axis=1, level=1)
+        f_div_yahoo = self.raw["f_div_yahoo"].xs(ticker, axis=1, level=1)
+        cum_gt_true = self.raw["cum_gt"].xs(ticker, axis=1, level=1)
+        cum_gt_yahoo = self.raw["cum_gt_yahoo"].xs(ticker, axis=1, level=1)
+
+        # Extract dividends and stock_splits.
+        div = self.raw[("dividends", ticker)]
+        splits = self.raw[("stock_splits", ticker)]
+
+        # Find event dates
+        div_dates = div[div.fillna(0) != 0].index
+        split_dates = splits[splits.fillna(0) != 0].index
+
+        # Pick one representative dividend and one split if they exist.
+        # Oldest will be the most interesting for both cases since we back-adjust.
+        dates_to_types = {}
+        if len(split_dates) > 0:
+            d = split_dates[0]
+            dates_to_types[d] = "split"
+
+            # Integer position of `d` in the index.
+            pos = self.raw.index.get_loc(d)
+
+            # Add previous and next index of event if within bounds.
+            if pos > 0:
+                dates_to_types[self.raw.index[pos - 1]] = "pre-split"
+            if pos < len(self.raw.index) - 1:
+                dates_to_types[self.raw.index[pos + 1]] = "post-split"
+
+        if len(div_dates) > 0:
+            d = div_dates[0]
+            dates_to_types[d] = "ex-dividend"
+
+            # Integer position of `d` in the index.
+            pos = self.raw.index.get_loc(d)
+
+            # Add previous and next index if within bounds.
+            if pos > 0:
+                dates_to_types[self.raw.index[pos - 1]] = "pre-dividend"
+            if pos < len(self.raw.index) - 1:
+                dates_to_types[self.raw.index[pos + 1]] = "post-dividend"
+
+        if dates_to_types:
+            # Create index of event dates
+            sorted_dates_to_types = dict(sorted(dates_to_types.items()))
+            idx = pd.Index(sorted_dates_to_types.keys())
+
+            df_events = pd.DataFrame(
+                {
+                    "Event": sorted_dates_to_types.values(),
+                    "Dividends": div.reindex(idx),
+                    "f_div (True)": f_div_true.reindex(idx),
+                    "f_div (Yahoo Approx)": f_div_yahoo.reindex(idx),
+                    r"Prod_{k > t} g_t (True)": cum_gt_true.reindex(idx),
+                    r"Prod_{k > t} g_t (Yahoo Approx)": cum_gt_yahoo.reindex(idx),
+                    "Stock Splits": splits.reindex(idx),
+                    "f_split (1; All Yahoo Data is Split Adjusted)": f_split.reindex(idx),
+                    "Close (True)": close_true.reindex(idx),
+                    "Close (Yahoo)": close_yahoo.reindex(idx),
+                    "Close (Yahoo Manual)": close_manual.reindex(idx),
+                },
+                index=idx,
+            )
+            df_events.index.name = "Date"
+        else:
+            # No events found for that ticker; return empty alignment table.
+            df_events = pd.DataFrame(
+                columns=[
+                    "Event",
+                    "Dividends",
+                    "f_div (True)",
+                    "f_div (Yahoo Approx)",
+                    r"Prod_{k > t} g_t (True)",
+                    r"Prod_{k > t} g_t (Yahoo)",
+                    "Stock Splits",
+                    "f_split (1; All Yahoo Data is Split Adjusted)",
+                    "Close (True)",
+                    "Close (Yahoo)",
+                    "Close (Yahoo Manual)",
+                ]
+            )
+
+        return df_mad, df_events
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2))
     def _fetch_tickers(self, adjusted=True) -> pd.DataFrame:
@@ -435,10 +470,10 @@ class DataLoader:
         """
 
         # Previous day's close per ticker
-        self._add_field_col_op("prev_close", "close", lambda t: t.shift(1))
+        self._add_field("prev_close", "close", lambda t: t.shift(1))
 
         # Dividends per ticker, fill missing with 0
-        self._add_field_col_op("div_clean", "dividends", lambda t: t.fillna(0.0))
+        self._add_field("div_clean", "dividends", lambda t: t.fillna(0.0))
 
         # Dividend adjustment factor f_div = 1 / (1 + D_t / P_{t - 1}) = P_{t - 1} / (P_{t - 1} + D_t)
         f_div = self.raw["prev_close"] / (self.raw["prev_close"] + self.raw["div_clean"])
@@ -517,8 +552,8 @@ class DataLoader:
         self._require_fields(["gt", "gt_yahoo"])
 
         # This cum product gives us product k >= t (greater equal, qe), we have to adjust to k > t later
-        self._add_field_col_op("cum_gt_qe", "gt", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
-        self._add_field_col_op("cum_gt_yahoo_qe", "gt_yahoo", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
+        self._add_field("cum_gt_qe", "gt", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
+        self._add_field("cum_gt_yahoo_qe", "gt_yahoo", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
 
         # Adjust to k > t
         cum_gt = self.raw["cum_gt_qe"] / self.raw["gt"]
