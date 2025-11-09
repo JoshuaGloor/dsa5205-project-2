@@ -290,6 +290,9 @@ class DataLoader:
         # Copy the old fields together with 'volume'
         df = self.raw[[*fields_old_new.keys(), "volume"]].copy()
 
+        # Set column names of MultiIndex
+        df.columns.names = ["OHLCV-TR", "Ticker"]
+
         # Return OHLCV and total return of desired source
         return df.rename(columns=fields_old_new, level=0)
 
