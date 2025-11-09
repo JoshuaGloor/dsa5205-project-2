@@ -44,8 +44,103 @@ class State(Enum):
     ADJUSTED = auto()
 
 
+def add_field(df: pd.DataFrame, field: str, base_field: str, func: Callable) -> pd.DataFrame:
+    """Add a new top-level field to a DataFrame with MultiIndex columns.
+
+    This function expects `df` to have MultiIndex columns of the form
+    (Field, Ticker), where each `Field` corresponds to a data type (e.g.,
+    "close", "adj_close", "volume") and each `Ticker` corresponds to a security.
+
+    The specified `func` is applied column-wise to the sub-DataFrame
+    corresponding to `base_field`, operating independently on each ticker's
+    time series. The result is then added back to `df` as a new top-level
+    field under `field`.
+
+    Use this helper for transformations that operate **along the time axis**
+    of each ticker, such as:
+      - Shifting or lagging values
+      - Cumulative or rolling computations
+      - Elementwise transformations (e.g., log, scaling)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The input DataFrame with MultiIndex columns of the form (Field, Ticker).
+    field : str
+        The name of the new field to add at the top level of the column MultiIndex.
+    base_field : str
+        The existing field name (level 0 of the MultiIndex) to transform.
+    func : Callable
+        A function applied independently to each ticker's sub-series within `base_field`.
+
+    Raises
+    ------
+    ValueError
+        If `df` does not have MultiIndex columns or if `base_field` is not present
+        in the first (Field) level of the MultiIndex.
+
+    Returns
+    -------
+    pd.DataFrame
+        The DataFrame with the new field joined into its MultiIndex columns.
+    """
+
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("Expected MultiIndex columns, but got a single-level Index.")
+
+    if base_field not in df.columns.get_level_values(0).unique():
+        raise ValueError(f"{base_field} is not a field in index level 0.")
+
+    df = df.join(
+        df[base_field]
+        .transform(func)
+        .set_axis(
+            pd.MultiIndex.from_product([[field], df[base_field].columns]),
+            axis=1,
+        )
+    )
+    return df
+
+
 @dataclass
 class DataLoader:
+    r"""A loader for fetching, adjusting, and verifying OHLCV data.
+
+    This class fetches raw price data from Yahoo Finance, computes adjustment
+    factors for splits and dividends, constructs back-adjusted price series,
+    and provides verification diagnostics and total-return series.
+
+    Parameters
+    ----------
+    tickers : list[str]
+        List of ticker symbols to fetch, e.g. `["AAPL", "NVDA", "MSFT"]`.
+    start : str
+        Start date (in `"YYYY-MM-DD"` format) for historical data retrieval.
+    end : str or None, optional
+        End date (in `"YYYY-MM-DD"` format). If `None`, data are fetched up to the
+        most recent available trading date.
+
+    Examples
+    --------
+    Basic usage::
+
+        >>> from src.pipeline.loader import DataLoader
+        >>> dl = DataLoader(["NVDA", "GOOG"], start="2010-01-01")
+
+        # Fetch data from Yahoo Finance
+        >>> dl.fetch_data()
+
+        # Apply split and dividend adjustments
+        >>> dl.adjust_data()
+
+        # Retrieve fully adjusted total-return data
+        >>> df_true = dl.get_adjusted_data("true")
+        >>> df_true[("total_return", "NVDA")].tail()
+
+        # Verify alignment and approximation accuracy
+        >>> mad_table, event_table = dl.verify_data()
+    """
+
     tickers: list[str]
     start: str  # "yyyy-mm-dd"
     end: str | None = None  # "yyyy-mm-dd" or None, which will return up to latest data available.
@@ -80,54 +175,99 @@ class DataLoader:
         return self
 
     def adjust_data(self) -> None:
-        r"""Execute the full price-adjustment pipeline for all tickers.
+        r"""Execute the full price-adjustment and total-return pipeline for all tickers.
 
-        This method sequentially applies the adjustment stages required to
-        construct fully back-adjusted price series. It transforms raw
-        unadjusted data into split and dividend-adjusted prices by executing
-        the following internal steps:
+        This method transforms raw, unadjusted prices into fully split- and
+        dividend-adjusted OHLC series and then computes corresponding total
+        return series for different adjustment conventions.
+
+        The adjustment pipeline proceeds through the following steps:
 
             1. `_fsplit()` : adds the split adjustment factor $f_t^{\text{split}}$
             2. `_fdiv()`   : adds the dividend adjustment factor $f_t^{\text{div}}$
             3. `_gt()`     : combines both into the total adjustment factor $g_t$
             4. `_cum_gt()` : computes the cumulative product $\prod_{k > t} g_k$
             5. `_adj()`    : constructs the back-adjusted OHLC price $A_t = P_t \cdot \prod_{k > t} g_k$
+
+        After constructing the adjusted price series, the method computes
+        total return series R_t^{\text{TR}} along the time axis via
+
+        $$
+        R_t^{\text{TR}} = \frac{A_t}{A_{t - 1}} - 1,
+        $$
+
+        where $A_t$ is the adjusted close at day $t$.
         """
 
         if self._state != State.FETCHED:
             raise RuntimeError("Data is not fetched yet, call `fetch_data` first.")
+        if self._state == State.ADJUSTED:
+            raise RuntimeError("Data is adjusted already.")
         self._state = State.ADJUSTED
 
         # Pipeline to adjust data
         self._fsplit()._fdiv()._gt()._cum_gt()._adj()
 
-    def get_adjusted_data(self, source="true") -> tuple[pd.DataFrame]:
-        """Return adjusted OHLCV data for all tickers.
+        # Calculate R_t^{\text{TR}} for Yahoo provided data
+        self.adj = add_field(self.adj, "total_return", "close", lambda t: t.pct_change())
 
-        This method provides access to adjusted price data based on the specified
-        adjustment source. Depending on the source, it either returns Yahoo Finance's
-        pre-adjusted data or makes adjusted prices using the loader's internally
-        computed adjustment factors available.
-        The idea is that 'yahoo' and 'manual' should be within machine precision,
-        and 'true' provides the adjusted prices using the non-approximated price
-        adjustment formula.
+        # Calculate R_t^{\text{TR}} for raw data
+        self.raw = add_field(self.raw, "total_return_true", "adj_close_true", lambda t: t.pct_change())
+        self.raw = add_field(self.raw, "total_return_manual", "adj_close_manual", lambda t: t.pct_change())
+
+    def get_adjusted_data(self, source="true") -> pd.DataFrame:
+        r"""Return adjusted OHLCV and total-return data for all tickers.
+
+        This method provides access to fully adjusted price data constructed
+        according to the specified adjustment source. Depending on the source,
+        it returns either Yahoo Finance's built-in adjusted series, manually
+        recomputed series using Yahoo's adjustment logic, or internally derived
+        "true" adjusted series based on the exact adjustment factors.
+
+        The adjusted dataset contains OHLCV fields and the corresponding total
+        return series:
+
+        $$
+        R_t^{\text{TR}} = \frac{A_t}{A_{t-1}} - 1,
+        $$
+
+        where $A_t$ is the adjusted close at day $t$.
 
         Parameters
         ----------
-        source : str, default `'true'`
-            The adjustment source to use. Must be one of:
+        source : {"true", "yahoo", "manual"}, default "true"
+            The adjustment source to use:
 
-              - 'true'  : returns correctly adjusted data computed internally from raw prices.
-              - 'yahoo' : returns Yahoo Finance's built-in adjusted prices.
-              - 'manual': returns manually adjusted data based on Yahoo's logic of adjusting prices
+              - "true"
+                Returns correctly adjusted data computed internally from raw
+                prices using exact (non-approximated) adjustment factors.
+
+              - "yahoo"
+                Returns Yahoo Finance's pre-adjusted OHLC data as provided by
+                the data vendor.
+
+              - "manual"
+                Returns manually adjusted data reconstructed using Yahoo's own
+                approximate adjustment logic, intended to match the "yahoo"
+                series up to machine precision.
 
         Returns
         -------
         pd.DataFrame
-            A DataFrame containing adjusted OHLCV data for all tickers.
+            DataFrame containing adjusted OHLCV and total-return data for all
+            tickers.
+
             - Index: trading dates.
             - Columns: MultiIndex with levels `["Field", "Ticker"]`, where
-              "Field" includes ["open", "high", "low", "close", "volume"].
+              `"Field"` includes
+              `["open", "high", "low", "close", "volume", "total_return"]`.
+
+        Raises
+        ------
+        ValueError
+            If `source` is not one of {"true", "yahoo", "manual"}.
+        RuntimeError
+            If the data have not yet been adjusted (i.e., `adjust_data()` was not called).
         """
 
         sources = ["true", "yahoo", "manual"]
@@ -144,53 +284,111 @@ class DataLoader:
         ohlc = ["open", "high", "low", "close"]
         # Prepare for renaming, e.g., we will rename 'adj_open_true' to 'open'.
         fields_old_new = {f"adj_{f}_{source}": f for f in ohlc}
+        # Add total return field
+        fields_old_new[f"total_return_{source}"] = "total_return"
 
-        # Copy the old ohlc fields together with 'volume'
+        # Copy the old fields together with 'volume'
         df = self.raw[[*fields_old_new.keys(), "volume"]].copy()
 
-        # Return OHLCV of desired source
+        # Return OHLCV and total return of desired source
         return df.rename(columns=fields_old_new, level=0)
 
-    def verify_data(self) -> pd.DataFrame:
-        """Verify correctness of the back-adjusted price construction.
+    def verify_data(self, ticker="") -> tuple[pd.DataFrame]:
+        r"""Verify correctness of the adjusted-price and total-return construction.
 
-        This method compares the adjusted closing prices obtained from different
-        adjustment sources and reports the mean absolute differences (MAD) between them.
+        This method validates the internal price-adjustment and total-return
+        pipeline by comparing results from different adjustment sources and
+        inspecting alignment around corporate-action events such as dividends
+        and stock splits.
 
-        Specifically, two comparisons are performed:
+        Two forms of verification are performed:
 
-        1. **Yahoo vs. true:**
-           Compares Yahoo's approximate dividend-adjustment logic with the
-           internally computed "true" adjustment factors. The resulting MAD
-           quantifies the approximation error introduced by Yahoo's method.
+        1. **Return continuity (mean absolute difference):**
+            Computes the mean absolute differences (MAD) of total return series between:
 
-        2. **Yahoo vs. manual recomputation:**
-           Compares Yahoo's adjusted prices with a manual recomputation based on
-           Yahoo's logic. The resulting MAD should be at or near machine precision.
+            - *Yahoo vs. True*:
+              Quantifies the deviation introduced by Yahoo's approximate
+              dividend-adjustment logic compared to the internally computed
+              “true” adjustment factors.
+
+            - *Yahoo vs. Manual*:
+              Compares Yahoo's own adjusted data to a manual recomputation of
+              Yahoo's adjustment logic. Differences should be within machine precision.
+
+        2. **Event alignment inspection:**
+           Selects a representative ticker (preferring *NVDA* if available)
+           and extracts dividend and split events.
+           For each event, the method compiles a small table containing the
+           event type and surrounding dates (pre-/post-event).
+
+        These diagnostics allow visual and numerical verification that
+        (i) Yahoo's approximated adjustment factors differ only negligibly
+        from the mathematically correct ones, and
+        (ii) events are properly aligned in the adjustment pipeline.
+
+        Parameters
+        ----------
+        ticker : str,  default ""
+            The ticker for which the verification should be performed.
+            - If specified and the ticker exists, that one is chosen.
+            - Otherwise "NVDA" is selected if it exists and otherwise
+              the ticker which is the first one in the level 1 index.
 
         Returns
         -------
-        pd.DataFrame
-            DataFrame summarizing mean absolute differences (MAD) between
-            adjusted close prices from different sources for each ticker. Columns include:
+        tuple of (pd.DataFrame, pd.DataFrame)
+            A pair of diagnostic tables:
 
-            - `"MAD Yahoo and True"`: Mean absolute difference between Yahoo's and true adjustment logic.
-            - `"MAD Yahoo and Manual Recomputation"`: Mean absolute difference between
-              Yahoo's adjusted prices and a manual recomputation of them.
+            **(1) df_mad**
+                Summary table of mean absolute differences (MAD).
+                Columns include:
+
+                - `"MAD Yahoo and True"` - Mean absolute difference between Yahoo's
+                  and true total-return series.
+                - `"MAD Yahoo and Manual Recomputation"` - Mean absolute difference
+                  between Yahoo's and manually recomputed total-return series.
+
+            **(2) df_events**
+                Event-level alignment table for one representative ticker.
+                Indexed by event dates and containing columns such as:
+
+                - `"Event"`: Event type ("split", "ex-dividend", "pre-split", ...)
+                - `"Dividends"`: Dividend amounts
+                - `"f_div (True)"` and `"f_div (Yahoo Approx)"`: Dividend adjustment factors
+                - `"Prod_{k > t} g_t (True)"` and `"Prod_{k > t} g_t (Yahoo Approx)"`:
+                  cumulative adjustment products
+                - `"Stock Splits"`: Split ratios
+                - `"f_split"`: Split adjustment factor; always 1 because Yahoo data is split adjusted.
+                - `"Total Return (True)"`, `"Total Return (Yahoo)"`, `"Total Return (Yahoo Manual)"`:
+                  aligned total-return series
+
+        Raises
+        ------
+        RuntimeError
+            If data have not yet been adjusted (`adjust_data()` not called).
+        ValueError
+            If ticker selected but not part of fetched data.
         """
 
         if self._state != State.ADJUSTED:
             raise RuntimeError("Data is not adjusted yet, call `adjust_data` first.")
+        if ticker != "" and ticker not in self.raw.columns.get_level_values(1).unique():
+            raise ValueError("{ticker} not in fetched data.")
+
+        true = self.get_adjusted_data("true")
+        yahoo = self.get_adjusted_data("yahoo")
+        manual = self.get_adjusted_data("manual")
 
         # ---------- Mean absolute difference checks ---------- #
-        # Calculate mean absolute difference (MAD) between our adj close and Yahoo's.
+        # Calculate mean absolute difference (MAD) between our true return and Yahoo's.
         # This shows the difference between Yahoo's approximated dividend adjustement factor and the true one.
-        yahoo_true_diff = (self.adj["close"] - self.raw["adj_close_true"]).abs()
+        # This is **NOT** expected to be within machine precision!
+        yahoo_true_diff = (yahoo["total_return"] - true["total_return"]).abs()
         mad_yahoo_true = yahoo_true_diff.mean()
 
         # Calculate mean absolute difference (MAD) between manual recalculation of Yahoo's data and Yahoo's.
         # This is expected to be machine precision.
-        yahoo_manual_diff = (self.adj["close"] - self.raw["adj_close_manual"]).abs()
+        yahoo_manual_diff = (yahoo["total_return"] - manual["total_return"]).abs()
         mad_yahoo_manual = yahoo_manual_diff.mean()
 
         df_mad = pd.DataFrame(
@@ -199,24 +397,26 @@ class DataLoader:
 
         # ---------- Event alignment checks ---------- #
         # Choose ticker for event inspection.
-        # We choose NVDA if it is part of the tickers because it is our focus and it had both dividends and splits.
-        tickers = self.raw["close"].columns
-        if "NVDA" in tickers:
-            ticker = "NVDA"
-        else:
-            ticker = tickers[0]
+        # If ticker not selected, we choose NVDA if it is part of the tickers
+        # because it is our focus and it had both dividends and splits in recent times.
+        if ticker == "":
+            tickers = self.raw["close"].columns
+            if "NVDA" in tickers:
+                ticker = "NVDA"
+            else:
+                ticker = tickers[0]
 
-        # Extract per-ticker series.
-        close_true = self.raw["adj_close_true"].xs(ticker, axis=1, level=1)
-        close_yahoo = self.adj["close"].xs(ticker, axis=1, level=1)
-        close_manual = self.raw["adj_close_manual"].xs(ticker, axis=1, level=1)
+        # Extract per-ticker series of return.
+        return_true = true[("total_return", ticker)]
+        return_yahoo = yahoo[("total_return", ticker)]
+        return_manual = manual[("total_return", ticker)]
 
         # Extract interesting columns.
-        f_split = self.raw["f_split"].xs(ticker, axis=1, level=1)
-        f_div_true = self.raw["f_div"].xs(ticker, axis=1, level=1)
-        f_div_yahoo = self.raw["f_div_yahoo"].xs(ticker, axis=1, level=1)
-        cum_gt_true = self.raw["cum_gt"].xs(ticker, axis=1, level=1)
-        cum_gt_yahoo = self.raw["cum_gt_yahoo"].xs(ticker, axis=1, level=1)
+        f_split = self.raw[("f_split", ticker)]
+        f_div_true = self.raw[("f_div", ticker)]
+        f_div_yahoo = self.raw[("f_div_yahoo", ticker)]
+        cum_gt_true = self.raw[("cum_gt", ticker)]
+        cum_gt_yahoo = self.raw[("cum_gt_yahoo", ticker)]
 
         # Extract dividends and stock_splits.
         div = self.raw[("dividends", ticker)]
@@ -270,13 +470,12 @@ class DataLoader:
                     r"Prod_{k > t} g_t (Yahoo Approx)": cum_gt_yahoo.reindex(idx),
                     "Stock Splits": splits.reindex(idx),
                     "f_split (1; All Yahoo Data is Split Adjusted)": f_split.reindex(idx),
-                    "Close (True)": close_true.reindex(idx),
-                    "Close (Yahoo)": close_yahoo.reindex(idx),
-                    "Close (Yahoo Manual)": close_manual.reindex(idx),
+                    "Total Return (True)": return_true.reindex(idx),
+                    "Total Return (Yahoo)": return_yahoo.reindex(idx),
+                    "Total Return (Yahoo Manual)": return_manual.reindex(idx),
                 },
                 index=idx,
             )
-            df_events.index.name = "Date"
         else:
             # No events found for that ticker; return empty alignment table.
             df_events = pd.DataFrame(
@@ -289,11 +488,13 @@ class DataLoader:
                     r"Prod_{k > t} g_t (Yahoo)",
                     "Stock Splits",
                     "f_split (1; All Yahoo Data is Split Adjusted)",
-                    "Close (True)",
-                    "Close (Yahoo)",
-                    "Close (Yahoo Manual)",
+                    "Total Return (True)",
+                    "Total Return (Yahoo)",
+                    "Total Return (Yahoo Manual)",
                 ]
             )
+        df_events.index.name = "Date"
+        df_events.columns = pd.MultiIndex.from_product([[ticker], df_events.columns], names=["Ticker", "Diagnostics"])
 
         return df_mad, df_events
 
@@ -360,44 +561,6 @@ class DataLoader:
         if missing:
             raise MethodChainError(f"Missing required fields: {missing}")
 
-    def _add_field(self, field: str, base_field: str, func: Callable) -> Self:
-        """Add a new field to the MultiIndex DataFrame by applying a column-wise transformation.
-
-        This helper applies a transformation function independently to each ticker's
-        time series within `self.raw[base_field]`, and then joins the transformed result
-        back into `self.raw` as a new top-level field in the MultiIndex columns.
-
-        Use this method for transformations that operate **along the time axis** of each
-        ticker, such as:
-          - Shifting or lagging values
-          - Cumulative or rolling computations
-          - Elementwise transformations
-
-        Parameters
-        ----------
-        field : str
-            The name of the new field to add
-        base_field : str
-            The name of the existing field to transform
-        func : Callable
-            A function applied to the base_field column independently for each ticker.
-
-        Returns
-        -------
-        Self
-            The modified instance with the new field joined into `self.raw`.
-        """
-
-        self.raw = self.raw.join(
-            self.raw[base_field]
-            .transform(func)
-            .set_axis(
-                pd.MultiIndex.from_product([[field], self.raw[base_field].columns]),
-                axis=1,
-            )
-        )
-        return self
-
     def _fsplit(self) -> Self:
         r"""Add the stock-split adjustment factor $f_t^{\text{split}}$ to each ticker.
 
@@ -434,7 +597,7 @@ class DataLoader:
 
             self.raw = self.raw.join(ones)
         else:  # This branch should be executed if true unadjusted prices were available.
-            self._add_field("f_split", "stock_splits", lambda t: np.where(t.fillna(0) != 0, 1 / t, 1.0))
+            self.raw = add_field(self.raw, "f_split", "stock_splits", lambda t: np.where(t.fillna(0) != 0, 1 / t, 1.0))
         return self
 
     def _fdiv(self) -> Self:
@@ -470,10 +633,10 @@ class DataLoader:
         """
 
         # Previous day's close per ticker
-        self._add_field("prev_close", "close", lambda t: t.shift(1))
+        self.raw = add_field(self.raw, "prev_close", "close", lambda t: t.shift(1))
 
         # Dividends per ticker, fill missing with 0
-        self._add_field("div_clean", "dividends", lambda t: t.fillna(0.0))
+        self.raw = add_field(self.raw, "div_clean", "dividends", lambda t: t.fillna(0.0))
 
         # Dividend adjustment factor f_div = 1 / (1 + D_t / P_{t - 1}) = P_{t - 1} / (P_{t - 1} + D_t)
         f_div = self.raw["prev_close"] / (self.raw["prev_close"] + self.raw["div_clean"])
@@ -552,8 +715,10 @@ class DataLoader:
         self._require_fields(["gt", "gt_yahoo"])
 
         # This cum product gives us product k >= t (greater equal, qe), we have to adjust to k > t later
-        self._add_field("cum_gt_qe", "gt", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
-        self._add_field("cum_gt_yahoo_qe", "gt_yahoo", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
+        self.raw = add_field(self.raw, "cum_gt_qe", "gt", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1])
+        self.raw = add_field(
+            self.raw, "cum_gt_yahoo_qe", "gt_yahoo", lambda t: t.fillna(1).iloc[::-1].cumprod().iloc[::-1]
+        )
 
         # Adjust to k > t
         cum_gt = self.raw["cum_gt_qe"] / self.raw["gt"]
