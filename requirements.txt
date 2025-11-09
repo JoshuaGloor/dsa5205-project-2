@@ -4,8 +4,9 @@
 numpy
 pandas
 
-# Data
+# Data and related helpers
 yfinance
+tenacity
 
 # ML
 scikit-learn
