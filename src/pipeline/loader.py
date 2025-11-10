@@ -91,6 +91,9 @@ def add_field(df: pd.DataFrame, field: str, base_field: str, func: Callable) -> 
     if base_field not in df.columns.get_level_values(0).unique():
         raise ValueError(f"{base_field} is not a field in index level 0.")
 
+    if field in df.columns.get_level_values(0).unique():
+        raise ValueError(f"Field '{field}' already exists in data_cube.")
+
     df = df.join(
         df[base_field]
         .transform(func)
@@ -289,6 +292,9 @@ class DataLoader:
 
         # Copy the old fields together with 'volume'
         df = self.raw[[*fields_old_new.keys(), "volume"]].copy()
+
+        # Set column names of MultiIndex
+        df.columns.names = ["OHLCV-TR", "Ticker"]
 
         # Return OHLCV and total return of desired source
         return df.rename(columns=fields_old_new, level=0)
