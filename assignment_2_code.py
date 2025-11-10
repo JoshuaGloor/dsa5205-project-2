@@ -7,9 +7,9 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.18.1
 #   kernelspec:
-#     display_name: base
+#     display_name: Python (p2)
 #     language: python
-#     name: python3
+#     name: p2
 # ---
 
 # %% [markdown]
@@ -62,9 +62,95 @@ from arch import arch_model # For GARCH
 import warnings # Added to suppress convergence warnings
 from itertools import product # Needed for ENet grid search
 
+from src.pipeline.loader import DataLoader
+from src.pipeline.preprocess import (
+    add_log_return,
+    add_close_to_open_return,
+    add_realized_annualized_volatility,
+    add_momentum,
+    add_liquidity
+)
+
 # Personal plot configuration
 plt.style.use('seaborn-v0_8-darkgrid')
 plt.rcParams['figure.figsize'] = (12, 6)
+
+# %% [markdown]
+# # 1. Config
+
+# %%
+START = "2023-07-01"
+END = "2025-06-30"
+
+TARGET = ["NVDA"]
+PEERS = ['INTC', 'TSM', 'MU', 'AMAT', 'KLAC', 'LRCX', 'SMCI', 'ASML', 'MBGYY', 'NOW', 'LI', 'NOK', 'HNHPF', 'IQV', 'TMUS', 'LCID', 'AKAM', 'SOUN', 'JNJ']
+
+CONTROLS = ["SOXX"]
+CTRL_COL = "SOXX"  # Define control column name explicitly (for using only one)
+
+ALL_TICKERS = sorted(set(TARGET + PEERS + CONTROLS))
+
+# %% [markdown]
+# # 2. Load Data
+
+# %%
+dl = DataLoader(
+    tickers=ALL_TICKERS,
+    start=START,
+    end=END,
+)
+
+# Fetch and adjust data
+dl.fetch_data().adjust_data()
+
+# MultiIndex ["OHLCV-TR", "Ticker"], with level 0: ["open", "high", "low", "close", "volume", "total_return"]
+# All prices and total_return as in Appendix B.
+data_cube = dl.get_adjusted_data(source="true")
+
+# %% [markdown]
+# ## 2.1 Verify Data Load
+
+# %%
+# Generate needed verification dataframes as suggested in Appendix B.4
+return_continuity, event_alignment = dl.verify_data("NVDA")
+
+# %% [markdown]
+# ### 2.1.1 Mean Absolute Difference of Returns by Ticker
+#
+# - Left column: Yahoo with the manual computation using the correct dividend adjustment formula ('True')
+# - Right column: Yahoo with manual recomputation using Yahoo's approximated dividend adjustment formula ('Manual')."
+
+# %%
+return_continuity
+
+# %% [markdown]
+# ### 2.1.2 Event Alignment
+#
+# - Event date (dividend and split if available) including +- 1 day of event.
+# - Also displays formulas used for computation.
+# - We explicitly note again that f_split is all 1 because Yahoo data is split adjusted. This is **NOT** a mistake! See method `_fsplit` in `src/pipeline/loader.py` for details.
+
+# %%
+event_alignment
+
+# %% [markdown]
+# ### 2. Add Features
+
+# %%
+# Note, each ticker has all the features.
+# Think of this as a pipeline that is run once.
+# Rerunning it will throw exceptions on purpose because the fields already exist.
+data_cube = add_log_return(data_cube)  # Field: "log_return"
+data_cube = add_close_to_open_return(data_cube)  # Field: "log_ret_co"
+data_cube = add_realized_annualized_volatility(data_cube, days=5)  # Field: "vol5"
+data_cube = add_momentum(data_cube, days=1) # Field: "mom1"
+data_cube = add_momentum(data_cube, days=5) # Field: "mom5"
+data_cube = add_liquidity(data_cube) # Field: "log_dvol"
+
+# %% [markdown]
+# # TODO Continue here
+#
+# **unmodified code below; Joshua to figure out how to merge features in**
 
 # %%
 # Step 1: Source the adjusted close data from yahoo, and find the closed-to-closed for features, and closed-to-open for target, and merge into a cleaned DF
