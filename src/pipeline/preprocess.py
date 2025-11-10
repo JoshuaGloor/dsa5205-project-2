@@ -58,6 +58,36 @@ def add_log_return(data_cube: pd.DataFrame) -> pd.DataFrame:
 
 
 @requires_data_cube
+def add_close_to_open_return(data_cube: pd.DataFrame) -> pd.DataFrame:
+    r"""Add close-to-open (overnight) log return.
+
+    The close-to-open return measures the price change between a day's
+    adjusted close and the following day's adjusted open:
+
+    $$
+    R_t^{\text{CO}} = \log(\frac{O_{t+1}}{A_t})
+    $$
+
+    Parameters
+    ----------
+    data_cube : pd.DataFrame
+        Input data cube with fields "close" and "open".
+
+    Returns
+    -------
+    pd.DataFrame
+        Original data augmented with a new field "log_ret_co".
+    """
+
+    open_next = data_cube["open"].shift(-1)
+    log_ret_co = np.log(open_next / data_cube["close"])
+
+    # Add new columns back to MultiIndex
+    log_ret_co.columns = pd.MultiIndex.from_product([["log_ret_co"], log_ret_co.columns])
+    return data_cube.join([log_ret_co])
+
+
+@requires_data_cube
 def add_realized_annualized_volatility(data_cube: pd.DataFrame, days) -> pd.DataFrame:
     r"""Add realized annualized volatility estimated over a rolling window.
 
@@ -139,17 +169,7 @@ def add_liquidity(data_cube: pd.DataFrame) -> pd.DataFrame:
     """
 
     log_dvol = np.log((data_cube["close"] * data_cube["volume"]).replace(0, np.nan))
+
+    # Add new columns back to MultiIndex
     log_dvol.columns = pd.MultiIndex.from_product([["log_dvol"], log_dvol.columns])
     return data_cube.join([log_dvol])
-
-
-# def slice_cube(data_cube: pd.DataFrame) -> tuple[pd.DataFrame, ...]:
-#
-#    return (
-#        data_cube["open"],
-#        data_cube["high"],
-#        data_cube["low"],
-#        data_cube["close"],
-#        data_cube["volume"],
-#        data_cube["total_return"],
-#    )
