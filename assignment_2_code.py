@@ -134,7 +134,7 @@ return_continuity
 event_alignment
 
 # %% [markdown]
-# ### 2. Add Features
+# # 3. Add Features
 
 # %%
 # Note, each ticker has all the features.
@@ -146,6 +146,42 @@ data_cube = add_realized_annualized_volatility(data_cube, days=5)  # Field: "vol
 data_cube = add_momentum(data_cube, days=1) # Field: "mom1"
 data_cube = add_momentum(data_cube, days=5) # Field: "mom5"
 data_cube = add_liquidity(data_cube) # Field: "log_dvol"
+
+
+# %% [markdown]
+# # 3. Build Feature Matrix and Label Vector
+
+# %%
+def flatten_columns(data_cube, sep="_"):
+
+    df = data_cube.copy()
+    new_cols = [f"{t}{sep}{f}" for (f, t) in df.columns]
+    df.columns = pd.Index(new_cols)
+    return df
+
+
+# %%
+LABEL_COL = "y_nvda_co"
+FEATURES = ["log_return", "vol5", "mom1", "mom5", "log_dvol"]
+
+# %%
+# Label: TARGET (NVDA) close -> open; copy to avoid aliasing.
+y_dirty = data_cube["log_ret_co"][TARGET].rename(columns={TARGET[0]: LABEL_COL}, copy=True).rename_axis("Features", axis=1)
+y = y_dirty.dropna()
+
+# %%
+X_raw = flatten_columns(data_cube[FEATURES])
+
+# %%
+X = X_raw.loc[y.index]
+
+# %%
+X_y = X.join(y)
+
+# %%
+X_y
+
+# %%
 
 # %% [markdown]
 # # TODO Continue here
