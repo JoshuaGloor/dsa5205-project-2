@@ -82,13 +82,12 @@ plt.rcParams['figure.figsize'] = (12, 6)
 START = "2023-07-01"
 END = "2025-06-30"
 
-TARGET = ["NVDA"]
+TARGET = "NVDA"
 PEERS = ['INTC', 'TSM', 'MU', 'AMAT', 'KLAC', 'LRCX', 'SMCI', 'ASML', 'MBGYY', 'NOW', 'LI', 'NOK', 'HNHPF', 'IQV', 'TMUS', 'LCID', 'AKAM', 'SOUN', 'JNJ']
 
-CONTROLS = ["SOXX"]
-CTRL_COL = "SOXX"  # Define control column name explicitly (for using only one)
+CTRL_TICKER = "SOXX"  # Define control column name explicitly (for using only one)
 
-ALL_TICKERS = sorted(set(TARGET + PEERS + CONTROLS))
+ALL_TICKERS = sorted(set([TARGET] + PEERS + [CTRL_TICKER]))
 
 # %% [markdown]
 # # 2. Load Data
@@ -152,10 +151,15 @@ data_cube = add_liquidity(data_cube) # Field: "log_dvol"
 # # 3. Build Feature Matrix and Label Vector
 
 # %%
+def _col(ticker: str, feature: str, pattern="{ticker}_{feature}") -> str:
+    return pattern.format(ticker=ticker, feature=feature)
+
+
+# %%
 def flatten_columns(data_cube, sep="_"):
 
     df = data_cube.copy()
-    new_cols = [f"{t}{sep}{f}" for (f, t) in df.columns]
+    new_cols = [_col(t, f) for (f, t) in df.columns]
     df.columns = pd.Index(new_cols)
     return df
 
@@ -166,7 +170,7 @@ FEATURES = ["log_return", "vol5", "mom1", "mom5", "log_dvol"]
 
 # %%
 # Label: TARGET (NVDA) close -> open; copy to avoid aliasing.
-y_dirty = data_cube["log_ret_co"][TARGET].rename(columns={TARGET[0]: LABEL_COL}, copy=True).rename_axis("Features", axis=1)
+y_dirty = data_cube["log_ret_co"][[TARGET]].rename(columns={TARGET: LABEL_COL}, copy=True).rename_axis("Features", axis=1)
 y = y_dirty.dropna()
 
 # %%
@@ -274,11 +278,26 @@ def summarize_results(results_store: dict) -> pd.DataFrame:
 
 
 # %%
-# Get all column names that are peers (thus not the target NVDA, or the control SOXX) from FEATURE_COLS
-peers_all = [c for c in FEATURE_COLS if c not in ["NVDA", CTRL_COL]] # NVDA shouldn't be in FEATURE_COLS, but added check for safety
-# Safety check to ensure all peers selected are actually in the initial DataFrame X_y
-use_peers = [c for c in peers_all if c in X_y.columns]
+CTRL_COL = _col(CTRL_TICKER, "log_return")
 
+# %%
+LOG_RETURN_COLS = [col for col in X_y.columns if "log_return" in col]
+
+# %%
+PEERS_ALL = [col for col in LOG_RETURN_COLS if (CTRL_TICKER not in col) or (TARGET not in col)] 
+
+# %%
+USE_PEERS = PEERS_ALL
+
+
+# %%
+def check_df_empty(df):
+    return df is None or not isinstance(df, pd.DataFrame) or df.shape[0] == 0 or df.isna().all().all()
+
+
+# %%
+
+# %%
 
 # %% [markdown]
 # # TODO Continue here
@@ -293,7 +312,7 @@ use_peers = [c for c in peers_all if c in X_y.columns]
 def calculate_betas(train_df_raw: pd.DataFrame,
                     feature_cols,
                     ctrl_col: str,
-                    peers_list):
+                    peers_list=PEERS_ALL):
     """
     Estimate a single slope beta for each peer vs the control factor on the TRAIN set.
     Returns: dict {peer -> beta}.
@@ -306,7 +325,7 @@ def calculate_betas(train_df_raw: pd.DataFrame,
     if ctrl_col not in train_df_raw.columns:
         raise KeyError(f"Control column '{ctrl_col}' not found in training data.")
 
-    ctrl = train_df_raw[ctrl_col].astype(float)
+    ctrl = train_df_raw[ctrl_col]
 
     # De-mean control once for numerical stability
     x = (ctrl - ctrl.mean()).to_frame(name=ctrl_col)
@@ -317,7 +336,7 @@ def calculate_betas(train_df_raw: pd.DataFrame,
 
         y_raw = train_df_raw[p].astype(float)
         df = pd.concat([x, (y_raw - y_raw.mean()).rename(p)], axis=1).dropna()
-        if df.empty or df[ctrl_col].nunique() < 2:
+        if check_df_empty(df):
             betas[p] = 0.0
             continue
 
@@ -445,7 +464,7 @@ def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=None):
     ])
 
     final_fit_df = X_tv_res.join(y_tv).dropna()
-    if final_fit_df.empty:
+    if check_df_empty(final_fit_df):
         print("[ERROR] Combined Train+Val residualized data empty. Cannot fit final model.")
         return best_alpha, None, common_features
 
@@ -463,7 +482,7 @@ def ridge_fixedfwd_resid_eval(
     feature_cols=FEATURE_COLS,   # raw feature cols in X_y
     label_col=LABEL_COL,
     ctrl_col=CTRL_COL,
-    peers_list=use_peers,        # peers for residualization
+    peers_list=USE_PEERS,        # peers for residualization
     train_offset=TRAIN_OFFSET,
     val_offset=VAL_OFFSET,
     test_offset=TEST_OFFSET,
@@ -493,7 +512,7 @@ def ridge_fixedfwd_resid_eval(
     print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()}   to {val_df_raw.index.max().date()}   ({len(val_df_raw)} days)")
     print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()}  to {test_df_raw.index.max().date()}  ({len(test_df_raw)} days)")
 
-    if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+    if check_df_empty(train_df_raw) or check_df_empty(val_df_raw) or check_df_empty(test_df_raw):
         raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
 
     # ---- 1) Residualization betas from TRAIN and apply to all splits ----
@@ -544,7 +563,7 @@ def ridge_fixedfwd_resid_eval(
     # ---- 3) Predict on TEST and compute PnL ----
     X_test_predict = X_test_full.reindex(columns=model_features)
     test_pred_df = X_test_predict.join(y_test.rename('y_real')).dropna()
-    if test_pred_df.empty:
+    if check_df_empty(test_pred_df):
         print("[WARN] No valid rows in TEST after NaN drop. Returning empty results.")
         return pd.DataFrame(columns=["y_hat","y_real","alpha","signal","signal_prev","cost","pnl"])
 
@@ -709,7 +728,7 @@ print(f"[INFO] Fixed Splits | Train: {train_df_raw.index.min().date()} to {train
 print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()} to {val_df_raw.index.max().date()} ({len(val_df_raw)} days)")
 print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()} to {test_df_raw.index.max().date()} ({len(test_df_raw)} days)")
 
-if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+if check_df_empty(train_df_raw) or check_df_empty(val_df_raw) or check_df_empty(test_df_raw):
     raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
 
 # --- 2. Calculate Betas ONCE on Training Data ---
@@ -721,7 +740,7 @@ def calculate_betas(train_data_raw, feature_list, ctrl_col_name, peers_list):
         for p in peers_list:
             if p in train_features_raw.columns:
                 df_tr = train_features_raw[[p, ctrl_col_name]].dropna()
-                if len(df_tr) >= 50 and df_tr[ctrl_col_name].std() > 1e-8:
+                if not check_df_empty(df_tr) and df_tr[ctrl_col_name].std().mean() > 1e-8:
                     try:
                         lr = LinearRegression().fit(df_tr[[ctrl_col_name]], df_tr[p])
                         betas[p] = float(lr.coef_[0])
@@ -733,7 +752,7 @@ def calculate_betas(train_data_raw, feature_list, ctrl_col_name, peers_list):
     return betas
 
 print("[INFO] Calculating residualization betas on fixed training set...")
-betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, USE_PEERS)
 print(f"[INFO] Betas calculated: { {k: f'{v:.4f}' for k, v in betas_fixed.items()} }") # Print formatted betas
 
 # --- 3. Apply Residualization to All Fixed Sets ---
@@ -758,18 +777,18 @@ def apply_resid_slice(df_raw_slice, betas_dict, feature_list, ctrl_col_name, pee
     return df_res
 
 print("[INFO] Applying residualization to Train, Val, Test sets...")
-X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
-X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
-X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
+X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
+X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
 
 # Define final feature columns based on residualization
 final_feature_cols = []
 if CTRL_COL in FEATURE_COLS: final_feature_cols.append(CTRL_COL)
-final_feature_cols += [p + "_res" for p in use_peers]
+final_feature_cols += [p + "_res" for p in USE_PEERS]
 print(f"[INFO] Using residualized features: {final_feature_cols}")
 
 # add style features (NVDA vol/mom/liquidity) into the design matrices
-style_candidates = ['nvda_vol5', 'nvda_mom1', 'nvda_mom5', 'nvda_log_dvol']  
+style_candidates = [_col(TARGET, feat) for feat in FEATURES]
 style_cols = [c for c in style_candidates if c in FEATURE_COLS]           
 
 X_train_full = pd.concat([X_train_res[final_feature_cols], train_df_raw[style_cols]], axis=1)  
@@ -788,14 +807,17 @@ def _best_alpha_by_val_lasso_fixed(X_train_full, y_train, X_val_full, y_val, alp
     if not common_features: return 1e-3, None # Default alpha, no model
 
     # Prepare training data (drop NaNs from features/target alignment)
-    train_fit_df = X_train_full[common_features].join(y_train).dropna()
-    if train_fit_df.empty: print("[ERROR] Lasso Tuning: Training data empty after NaN drop."); return 1e-3, None
+    # We first drop all columns that are entirely NaN, then drop rows that contain NaN values.
+    train_fit_df = X_train_full[common_features].join(y_train.to_frame()).dropna(axis=1, how="all").dropna(axis=0, how="any")
+    # Have to update common features because some might have been dropped due to all NaNs
+    common_features = [feat for feat in common_features if feat in train_fit_df.columns]
+    if check_df_empty(train_fit_df): print("[ERROR] Lasso Tuning: Training data empty after NaN drop."); return 1e-3, None
     Xtr_fit = train_fit_df[common_features]
     ytr_fit = train_fit_df[LABEL_COL]
 
     # Prepare validation data similarly
     val_pred_df = X_val_full[common_features].join(y_val).dropna()
-    if val_pred_df.empty: 
+    if check_df_empty(val_pred_df): 
         print("[WARN] Lasso Tuning: Validation data empty after NaN drop.")  # Continue; result might be less reliable
         Xva_pred = pd.DataFrame(columns=common_features, index=[])
         yva_eval = pd.Series(name=LABEL_COL, dtype=float)
@@ -810,7 +832,7 @@ def _best_alpha_by_val_lasso_fixed(X_train_full, y_train, X_val_full, y_val, alp
         ])
         try:
             pipe.fit(Xtr_fit, ytr_fit)
-            if not Xva_pred.empty:  # Only calculate MSE if validation data exists
+            if not check_df_empty(Xva_pred):  # Only calculate MSE if validation data exists
                  y_pred_val = pipe.predict(Xva_pred)
                  mse = mean_squared_error(yva_eval, y_pred_val)
                  if mse < best_mse: best_mse, best_alpha = mse, a
@@ -828,7 +850,7 @@ def _best_alpha_by_val_lasso_fixed(X_train_full, y_train, X_val_full, y_val, alp
     final_pipe = Pipeline([("scaler", StandardScaler(with_mean=True, with_std=True)),
                            ("lasso",  Lasso(alpha=best_alpha, random_state=42, max_iter=2000))])
     final_fit_df = X_tv_full.join(y_tv).dropna()
-    if final_fit_df.empty: print("[ERROR] Lasso final fit data empty."); return best_alpha, None
+    if check_df_empty(final_fit_df): print("[ERROR] Lasso final fit data empty."); return best_alpha, None
     try:
         final_pipe.fit(final_fit_df[common_features], final_fit_df[LABEL_COL])
     except ValueError as e:
@@ -854,7 +876,7 @@ else:
     test_records = []
     prev_sig = 0 # Initialize prev_sig for the fixed test period
 
-    if X_test_pred.empty:
+    if check_df_empty(X_test_pred):
          print("[WARN] No valid data points in the test set after dropping NaNs.")
          wf_lasso_fixed_res = pd.DataFrame()
     else:
@@ -865,7 +887,7 @@ else:
         # Align predictions with actuals and calculate PnL
         test_results_df = pd.DataFrame({'y_hat': y_hat_test}).join(y_test.rename('y_real')).dropna() # Ensure alignment and drop rows where y_real might be missing
 
-        if test_results_df.empty:
+        if check_df_empty(test_results_df):
              print("[WARN] No common dates between test predictions and actuals.")
              wf_lasso_fixed_res = pd.DataFrame()
         else:
@@ -883,7 +905,7 @@ else:
 register_results("Lasso_FixedFWD_Resid", wf_lasso_fixed_res)
 
 # Print head of results
-if not wf_lasso_fixed_res.empty:
+if not check_df_empty(wf_lasso_fixed_res):
     print("\n[INFO] wf_lasso_fixed_res (head of test results):")
     print(wf_lasso_fixed_res.head())
 else:
@@ -1010,6 +1032,9 @@ else:
     print("[INFO] results_store is empty. Nothing to plot.")
 
 # %% [markdown]
+# # TODO continue clean up here
+
+# %% [markdown]
 # ### Elastic Net
 
 # %%
@@ -1043,7 +1068,7 @@ else:
 if 'betas_fixed' not in locals():
     print("[INFO] Calculating residualization betas on fixed training set for Elastic Net...")
     # Ensure calculate_betas function is defined in a previous cell
-    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, USE_PEERS)
     print(f"[INFO] Betas calculated: { {k: f'{v:.4f}' for k, v in betas_fixed.items()} }")
 else:
     print("[INFO] Using existing fixed betas.")
@@ -1537,7 +1562,7 @@ else:
 # -----------------------------
 if 'betas_fixed' not in locals():
     print("[INFO] Calculating residualization betas on fixed TRAIN set for GARCH...")
-    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, USE_PEERS)
 else:
     print("[INFO] Using existing fixed betas.")
 
@@ -2140,7 +2165,7 @@ else:
 # --- 2) Residualize peers on TRAIN and apply to all splits ---
 if 'betas_fixed' not in locals():
     print("[INFO] Calculating residualization betas (TRAIN)...")
-    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, USE_PEERS)
 
 X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
 X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
