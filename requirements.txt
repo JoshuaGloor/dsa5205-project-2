@@ -11,6 +11,8 @@ tenacity
 # ML
 scikit-learn
 arch
+xgboost
+lightgbm
 
 # Plots and visual helpers
 matplotlib

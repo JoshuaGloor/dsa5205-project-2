@@ -7,13 +7,14 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.18.1
 #   kernelspec:
-#     display_name: base
+#     display_name: Python (p2)
 #     language: python
-#     name: python3
+#     name: p2
 # ---
 
 # %% [markdown]
-# ### Feature Stocks:
+# # Introduction
+# ## Feature Stocks:
 # MSFT, GOOGL, AMZN, ORCL:
 # https://investor.nvidia.com/news/press-release-details/2023/NVIDIA-Introduces-Generative-AI-Foundry-Service-on-Microsoft-Azure-for-Enterprises-and-Startups-Worldwide/default.aspx
 #
@@ -26,27 +27,26 @@
 # Others (competitors or suppliers): AMD, INTC, AVGO, TSM, ASML, AMAT, KLAC, LRCX, MU
 #
 #
-# ### Target Variable / asset:
+# ## Target Variable / asset:
 # We will be tracking the % change in NVIDIA share price movement, and thus the aim is to long or short the NVDA shares.
 # Frequency of predictions will be daily, as our goal is to take advantage of the rapid movements in AI-tech firm to predict NVDA movements at t+1.   
 #
-# ### Control / Benchmark:
+# ## Control / Benchmark:
 # We need an appropriate benchmark to trace when the broad market / sector moves so that any predictive signal from peers and the model isn’t just the market movements. An appropriate index we can use as a benchmark are SOXX (semi-conductor ETF which is invested in many companies listed as feature stocks such as AVGO, NVDA, AMD, and more) for industry movements, or SPY for overall market movements.
 # Implementation idea (for later): for each peer, regress its return on SOXX and use the residual as the feature (i.e., peer move beyond the sector). This isolates idiosyncratic spillovers into NVDA instead of generic semi beta.
 #
-# ### Currency
+# ## Currency
 # Will need to double check all the feature stocks, but they should all be in some US stock exchange (NYSE or NASDAQ). So we shouldn't have to deal with any foreign exchanage rates, and deal only with USD.
 #
-# ### Frequency:
+# ## Frequency:
 # As we are trying to capitalize on the rapid movements of we will choose daily
 #
-# ### Decision time:
+# ## Decision time:
 # We need to define the decision time (the timestamp when we form our signal using only information available by then, and lock in the trade we’ll place). I'm just going to set the decision time at U.S. cash close (at time t, ~16:00 New York), and execution time at next open (t+1).
 #
 # This allows the label choices to then align naturally, predicting at close for --> next-open. This avoids look-ahead, is easy to explain, and matches data availability (daily movements)
 
 # %%
-# Step 0: Import functions
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -66,204 +66,116 @@ from itertools import product # Needed for ENet grid search
 plt.style.use('seaborn-v0_8-darkgrid')
 plt.rcParams['figure.figsize'] = (12, 6)
 
-# %%
-# Step 1: Source the adjusted close data from yahoo, and find the closed-to-closed for features, and closed-to-open for target, and merge into a cleaned DF
-
-# --------------------
-# Config
-# --------------------
-START = "2023-07-01"                                # Define the data start date
-END   = "2025-06-30"                                # Define the data end date
-
-TARGET   = ["NVDA"]                                 # Stock we want to predict
-PEERS    = ['INTC', 'TSM', 'MU', 'AMAT', 'KLAC', 'LRCX', 'SMCI', 'ASML', 'MBGYY', 'NOW', 'LI', 'NOK', 'HNHPF', 'IQV', 'TMUS', 'LCID', 'AKAM', 'SOUN', 'JNJ']
-
-CONTROLS = ["SOXX"]                                 # Semiconductor sector ETF (control)
-CTRL_COL = "SOXX"                                   # Define control column name explicitly (for using only one)
-
-ALL_TICKERS = sorted(set(TARGET + PEERS + CONTROLS)) # Create a single, sorted list of all tickers to download
-
-# --------------------
-# Robust single-ticker fetch function
-# --------------------
-def fetch_one(ticker, start, end, max_tries=5, sleep_s=1.5):
-    """Return (adj_close_series, open_series, close_series, volume_series) indexed by trading dates, or (None, None, None, None) on failure."""
-    last_err = None                                 # Variable to store the last error
-    for k in range(max_tries):                      # Loop for retry attempts
-        try:
-            # Use yf.Ticker().history() to fetch data for one stock
-            h = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False, actions=False)
-            if h.empty:                             # Check if any data was returned
-                raise RuntimeError(f"No data for {ticker}")
-            
-            # Use 'Adj Close' if available (accounts for splits/dividends), else 'Close'
-            adj = h["Adj Close"] if "Adj Close" in h.columns else h["Close"]
-            opn = h["Open"]                         # Get the 'Open' price
-            cls = h["Close"]                        # Raw Close for C→O label base & liquidity
-            vol = h["Volume"]                       # Volume for liquidity features
-
-            adj.name = ticker                       # Set the pandas Series name to the ticker
-            opn.name = ticker                       # Set the pandas Series name to the ticker
-            cls.name = ticker                       # Name Close series
-            vol.name = ticker                       # Name Volume series
-            return adj, opn, cls, vol               # Return the two data series
-        
-        except Exception as e:                      # Catch any exception during download
-            last_err = e                            # Store the error
-            time.sleep(sleep_s * (k + 1))           # Wait before retrying (exponential backoff)
-            
-    print(f"[WARN] Failed {ticker}: {last_err}")    # Print a warning if all retries fail
-    return None, None, None, None                   # Return None if fetching failed
-
-# --------------------
-# Download loop and table assembly
-# --------------------
-adj_cols, open_cols = [], []                        # Initialize empty lists to store data series
-raw_close_cols, volume_cols = [], []                # Holders for raw Close and Volume
-
-for tkr in ALL_TICKERS:                             # Loop through every ticker in our master list
-    adj, opn, cls, vol = fetch_one(tkr, START, END) # Call the fetch function
-    if adj is not None: adj_cols.append(adj)        # Add adjusted close series to list if successful
-    if opn is not None: open_cols.append(opn)       # Add open price series to list if successful
-    if cls is not None: raw_close_cols.append(cls)  # Collect raw Close
-    if vol is not None: volume_cols.append(vol)     # Collect Volume
-
-# Combine all individual series into wide DataFrames
-adj_close = pd.concat(adj_cols, axis=1).sort_index() # axis=1 joins columns; sort by date
-open_px   = pd.concat(open_cols, axis=1).sort_index() # axis=1 joins columns; sort by date
-close     = pd.concat(raw_close_cols, axis=1).sort_index()   # Raw Close DF (used for CO label & liquidity)
-volume    = pd.concat(volume_cols, axis=1).sort_index()      # Volume DF (liquidity)
-
-print(f"[INFO] Raw shapes -> adj_close: {adj_close.shape} | open_px: {open_px.shape} | close: {close.shape} | volume: {volume.shape}")
-
+# %% [markdown]
+# # Config and Globals
 
 # %%
-# Step 2: Data Cleaning and Model table
+START = "2023-07-01"
+END = "2025-06-30"
 
-## Function to drop columns from that have too much missing data for sanity
-def drop_sparse(df, thresh=0.8):
-    keep = df.columns[df.notna().mean() >= thresh]  # Calculate % of non-NA values, keep if >= 80%
-    dropped = sorted(set(df.columns) - set(keep))   # Find which columns were dropped
-    if dropped:
-        print(f"[INFO] Dropping sparse tickers: {dropped}")
-    return df[keep]                                 # Return the filtered DataFrame
+TARGET = "NVDA"
+PEERS = ['INTC', 'TSM', 'MU', 'AMAT', 'KLAC', 'LRCX', 'SMCI', 'ASML', 'MBGYY', 'NOW', 'LI', 'NOK', 'HNHPF', 'IQV', 'TMUS', 'LCID', 'AKAM', 'SOUN', 'JNJ']
 
-adj_close = drop_sparse(adj_close, thresh=0.8)      # Clean the adj_close DataFrame
+CTRL_TICKER = "SOXX"
 
-# Align open_px to match adj_close's rows (index) and columns exactly
-open_px   = open_px.reindex(index=adj_close.index, columns=adj_close.columns)
-# Align raw close & volume to adj_close’s index/columns as well
-close     = close.reindex(index=adj_close.index, columns=adj_close.columns)
-volume    = volume.reindex(index=adj_close.index, columns=adj_close.columns)
+ALL_TICKERS = sorted(set([TARGET] + PEERS + [CTRL_TICKER]))
 
-# Define the tickers that MUST be present for the analysis
-must_have = [c for c in ["NVDA","SOXX"] if c in adj_close.columns]
-if len(must_have) < 2:
-    print("[WARN] NVDA or SOXX missing after cleaning.")
+# %% [markdown]
+# # Load Data
 
-# Keep only trading days where our 'must_have' tickers both have data
-idx_ok = adj_close.dropna(subset=must_have).index if must_have else adj_close.index
-adj_close = adj_close.loc[idx_ok]                   # Filter adj_close by these common dates
-open_px   = open_px.loc[idx_ok]                     # Filter open_px by these common dates
-# Keep close & volume on the same aligned date set
-close     = close.loc[idx_ok]
-volume    = volume.loc[idx_ok]
+# %%
+# Our data loader.
+from src.pipeline.loader import DataLoader
 
-print(f"[INFO] Cleaned shapes -> adj_close: {adj_close.shape} | open_px: {open_px.shape}")
-
-# Forward fill internal NaNs. We should be careful, but I believe it's relatively safe to use ensure time series continuity for short gaps that occur in the data due to
-# things like public holidays (common practice). It is an assumption we will need to highlight in the report though
-adj_close = adj_close.ffill()
-open_px   = open_px.ffill()
-
-# Forward fill raw close & volume to keep style features consistent
-close     = close.ffill()
-volume    = volume.ffill()
-
-# Drop initial rows if ffill couldn't fill
-initial_nas = (
-    adj_close.isna().any(axis=1) |
-    open_px.isna().any(axis=1)   |
-    close.isna().any(axis=1)     |  # Ensure raw close is present
-    volume.isna().any(axis=1)       # Ensure volume is present
+# %%
+dl = DataLoader(
+    tickers=ALL_TICKERS,
+    start=START,
+    end=END,
 )
-if initial_nas.any():
-    print(f"[INFO] Dropping {initial_nas.sum()} initial rows with NAs after ffill.")
-    adj_close = adj_close.loc[~initial_nas]
-    open_px   = open_px.loc[~initial_nas]
-    close     = close.loc[~initial_nas]
-    volume    = volume.loc[~initial_nas] 
-    print(f"[INFO] Final shapes after initial NA drop -> adj_close: {adj_close.shape} | open_px: {open_px.shape}")
 
-# --------------------
-# Returns construction
-# --------------------
-# ret_cc: close(t-1) -> close(t) log-returns (standard daily return)
-ret_cc = np.log(adj_close / adj_close.shift(1)).dropna() # shift(1) gets previous day's close
+# Fetch and adjust data
+dl.fetch_data().adjust_data()
 
-# ret_co: close(t) -> next open(t+1) log-returns (overnight return)
-open_next = open_px.shift(-1)                       # shift(-1) gets next day's open
+# MultiIndex ["OHLCV-TR", "Ticker"], with level 0: ["open", "high", "low", "close", "volume", "total_return"]
+# All prices and total_return as in Appendix B.
+data_cube = dl.get_adjusted_data(source="true")
 
-ret_co = np.log(open_next / close).dropna(how="all")       # Calculate log return from today's close to tomorrow's open
+# %% [markdown]
+# ## Verify Data Load
 
-# Label (y): Isolate NVDA's close-to-open return
-nvda_co = ret_co["NVDA"].dropna()                   # Get the 'NVDA' column from ret_co
-print(f"[INFO] Shapes -> ret_cc: {ret_cc.shape} | ret_co: {ret_co.shape} | nvda_co: {nvda_co.shape}")
+# %%
+# Generate needed verification dataframes as suggested in Appendix B.4
+return_continuity, event_alignment = dl.verify_data("NVDA")
 
-# --------------------
-# Modeling-ready table (X_y)
-# --------------------
-## Definitions:
-### X_t = Features: Peer/control daily returns (ret_cc) known at time t
-### y_t = Target:   NVDA's overnight return (nvda_co) from time t to t+1
+# %% [markdown]
+# ### Mean Absolute Difference of Returns by Ticker
+#
+# - Left column: Yahoo with the manual computation using the correct dividend adjustment formula ('True')
+# - Right column: Yahoo with manual recomputation using Yahoo's approximated dividend adjustment formula ('Manual')."
 
+# %%
+return_continuity
+
+# %% [markdown]
+# ### Event Alignment
+#
+# - Event date (dividend and split if available) including +- 1 day of event.
+# - Also displays formulas used for computation.
+# - We explicitly note again that f_split is all 1 because Yahoo data is split adjusted. This is **NOT** a mistake! See method `_fsplit` in `src/pipeline/loader.py` for details.
+
+# %%
+event_alignment
+
+# %% [markdown]
+# # Add Features
+
+# %%
+# Our methods for feature engineering.
+from src.pipeline.preprocess import (
+    add_log_return,
+    add_close_to_open_return,
+    add_realized_annualized_volatility,
+    add_momentum,
+    add_liquidity
+)
+
+# %%
+# Note, each ticker has all the features.
+# Think of this as a pipeline that is run once.
+# Rerunning it will throw exceptions on purpose because the fields already exist.
+data_cube = add_log_return(data_cube)  # Field: "log_return"
+data_cube = add_close_to_open_return(data_cube)  # Field: "log_ret_co"
+data_cube = add_realized_annualized_volatility(data_cube, days=5)  # Field: "vol5"
+data_cube = add_momentum(data_cube, days=1) # Field: "mom1"
+data_cube = add_momentum(data_cube, days=5) # Field: "mom5"
+data_cube = add_liquidity(data_cube) # Field: "log_dvol"
+
+# %% [markdown]
+# # Build Feature Matrix and Label Vector
+
+# %%
+# Some helpers that allowed us merge up and downstream code more easily.
+from src.merge_helpers import _col, flatten_columns
+
+# %%
+# Additional globals.
 LABEL_COL = "y_nvda_co"
-
-# Use all columns from ret_cc EXCEPT the target (NVDA) as features
-feature_cols = [c for c in ret_cc.columns if c not in TARGET]
-X = ret_cc[feature_cols].copy()                     # Create the feature matrix X
-
-# Align the target series (y) with the feature matrix (X)
-y = nvda_co.reindex(X.index)                        # This aligns dates (index t)
-# Join X and y, naming the target column 'y_nvda_co'
-X_y = X.join(y.rename(LABEL_COL))
-# Drop any rows where the target is missing (e.g., the last day)
-X_y = X_y.dropna(subset=[LABEL_COL])
-
-print("\n[INFO] Modeling table X_y:")
-print(f"Rows: {X_y.shape[0]} | Features: {X_y.shape[1]-1} | Target: y_nvda_co")
-print(X_y.head())
-
-# Check data date range
-print(f"\n[INFO] Data available from {X_y.index.min()} to {X_y.index.max()}")
+FEATURES = ["log_return", "vol5", "mom1", "mom5", "log_dvol"]
 
 # %%
-# Step 2.5: Add NVDA volatility, momentum, and liquidity features to X_y
+# Label: TARGET (NVDA) close -> open; renaming to work with downstream; copy to avoid aliasing.
+y_dirty = data_cube["log_ret_co"][[TARGET]].rename(columns={TARGET: LABEL_COL}, copy=True).rename_axis("Features", axis=1)
+y = y_dirty.dropna()
 
-# NVDA 5-day realized volatility (annualized) from C→C
-nvda_vol5 = (
-    ret_cc['NVDA'].rolling(5, min_periods=5).std() * np.sqrt(252/5)
-).rename('nvda_vol5')
+X_raw = flatten_columns(data_cube[FEATURES])
+# Drop dates (index) in X that were also dropped in y.
+X = X_raw.loc[y.index]
 
-# NVDA momentum (1D and 5D) from C→C
-nvda_mom1 = ret_cc['NVDA'].rename('nvda_mom1')
-nvda_mom5 = ret_cc['NVDA'].rolling(5, min_periods=5).sum().rename('nvda_mom5')
+X_y = X.join(y)
 
-# NVDA liquidity: log(dollar volume) at the close
-nvda_log_dvol = np.log((close['NVDA'] * volume['NVDA']).replace(0, np.nan)).rename('nvda_log_dvol')
-
-# Assemble and join to modeling table
-style_feats = pd.concat([nvda_vol5, nvda_mom1, nvda_mom5, nvda_log_dvol], axis=1)
-
-# Attach to X_y (ensure no look-ahead; all are based on information up to t)
-X_y = (
-    X_y.join(style_feats)
-       .dropna(subset=['nvda_vol5', 'nvda_mom1', 'nvda_mom5', 'nvda_log_dvol', LABEL_COL])
-)
-
-print(f"[INFO] X_y now includes style features. New shape: {X_y.shape}")
-print("[INFO] Added columns:", list(style_feats.columns))
-
+# %% [markdown]
+# # Metric and Evaluation Helpers
 
 # %%
 # Step 3: Configuration for Rolling Window Backtest
@@ -357,85 +269,30 @@ def summarize_results(results_store: dict) -> pd.DataFrame:
 
 
 
+# %% [markdown]
+# # Models and Validation
+
 # %%
-# Step 4: Residualization Helper Function
+# Merge helper.
+from src.merge_helpers import check_df_empty
 
-# Get all column names that are peers (thus not the target NVDA, or the control SOXX) from FEATURE_COLS
-peers_all = [c for c in FEATURE_COLS if c not in ["NVDA", CTRL_COL]] # NVDA shouldn't be in FEATURE_COLS, but added check for safety
-# Safety check to ensure all peers selected are actually in the initial DataFrame X_y
-use_peers = [c for c in peers_all if c in X_y.columns]
-
-# Calculates residuals for a single day's features (row_X) based on a historical training set (train_X)
-def residualize_row(train_X: pd.DataFrame, row_X: pd.Series, ctrl_col=CTRL_COL, peers=use_peers):
-    """
-    Calculates residuals for row_X (features at time t) using betas fitted ONLY on train_X (data up to t-1). Refits regression for each peer for every call.
-    """
-    out = {}                                        # Initialize an empty dictionary to store results
-    
-    # Get the control (SOXX) value for the current day (time t)
-    # Use .get() for safety in case row_X doesn't have the control column (though it should)
-    soxx_t = row_X.get(ctrl_col, np.nan)            # row_X = feature at time t to calculate the residual
-    
-    # Add the raw SOXX return to the output; it is not residualized (if present)
-    if ctrl_col in row_X.index:
-        out[ctrl_col] = soxx_t
-    else:
-        out[ctrl_col] = np.nan                      # keep column present even if missing
-    
-    for p in peers:                                 # Loop through each peer ticker
-        # Check if the peer and control columns exist in the training data (train_X)
-        if ctrl_col in train_X.columns and p in train_X.columns: # train_X = features up to time t-1 used for fitting model
-            
-            # Create a training subset of just this peer and the control, dropping NAs
-            df_tr = train_X[[p, ctrl_col]].dropna()
-            
-            # Check for sufficient data (>= 50 points) and variance (std > 0) to fit a model *in this training slice*
-            if len(df_tr) >= 50 and df_tr[ctrl_col].std() > 1e-8:
-                
-                # Fit a simple linear regression: peer_return ~ beta * soxx_return ON THE TRAINING DATA SLICE
-                try:
-                    lr = LinearRegression().fit(df_tr[[ctrl_col]], df_tr[p])
-                    # Get the beta (slope) from the fitted model
-                    beta = float(lr.coef_[0])
-                    
-                    # Calculate the residual for time t (using row_X values):
-                    # residual = actual_peer_return_t - predicted_peer_return_t
-                    peer_t = row_X.get(p, np.nan)   # Get current peer value safely
-                    if not pd.isna(peer_t) and not pd.isna(soxx_t):   # guard if control at t is NaN
-                         out[p + "_res"] = peer_t - (beta * soxx_t)
-                    else:
-                         out[p + "_res"] = np.nan    # Peer or control value missing at time t
-                except Exception as e:
-                    print(f"[WARN] LinReg fit failed for peer {p} in residualize_row: {e}")
-                    out[p + "_res"] = np.nan         # Could not calculate beta
-            
-            else:
-                # Not enough data or no variance in control in train_X to fit a model, so set residual to Not-a-Number
-                out[p + "_res"] = np.nan
-        else:
-            # Control or Peer columns were missing in train_X, so set residual to Not-a-Number
-            out[p + "_res"] = np.nan
-            
-    # Define the expected output columns consistently
-    final_cols_order = []
-    if ctrl_col in X_y.columns: # Check against original X_y columns for consistency
-        final_cols_order.append(ctrl_col)
-    final_cols_order += [p + "_res" for p in peers] # All potential residual columns
-
-    # Return a Series with consistent index/columns
-    return pd.Series(out, index=final_cols_order, dtype=float)
-
+# %%
+# Some more globals. These were also introduced to merge the code logic.
+CTRL_COL = _col(CTRL_TICKER, "log_return")
+LOG_RETURN_COLS = [col for col in X_y.columns if "log_return" in col]
+PEERS_ALL = [col for col in LOG_RETURN_COLS if (CTRL_TICKER not in col) or (TARGET not in col)]
+USE_PEERS = PEERS_ALL
 
 
 # %% [markdown]
-# ### Model 1: Ridge Regression
+# ## Model 1: Ridge Regression
 
 # %%
 # --- Residualization helpers: calculate_betas() and apply_resid_slice() ---
 def calculate_betas(train_df_raw: pd.DataFrame,
                     feature_cols,
                     ctrl_col: str,
-                    peers_list):
+                    peers_list=PEERS_ALL):
     """
     Estimate a single slope beta for each peer vs the control factor on the TRAIN set.
     Returns: dict {peer -> beta}.
@@ -448,7 +305,7 @@ def calculate_betas(train_df_raw: pd.DataFrame,
     if ctrl_col not in train_df_raw.columns:
         raise KeyError(f"Control column '{ctrl_col}' not found in training data.")
 
-    ctrl = train_df_raw[ctrl_col].astype(float)
+    ctrl = train_df_raw[ctrl_col]
 
     # De-mean control once for numerical stability
     x = (ctrl - ctrl.mean()).to_frame(name=ctrl_col)
@@ -459,7 +316,7 @@ def calculate_betas(train_df_raw: pd.DataFrame,
 
         y_raw = train_df_raw[p].astype(float)
         df = pd.concat([x, (y_raw - y_raw.mean()).rename(p)], axis=1).dropna()
-        if df.empty or df[ctrl_col].nunique() < 2:
+        if check_df_empty(df):
             betas[p] = 0.0
             continue
 
@@ -552,7 +409,7 @@ def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=None):
     # ---- 1) Validation loop to select alpha ----
     train_fit_df = X_train_res[common_features].join(y_train).dropna()
     val_fit_df   = X_val_res[common_features].join(y_val).dropna()
-    if train_fit_df.empty or val_fit_df.empty:
+    if check_df_empty(train_fit_df) or check_df_empty(val_fit_df):
         print("[ERROR] Empty TRAIN or VAL after NaN drop in _best_alpha_by_val.")
         return 1.0, None, common_features
 
@@ -587,7 +444,7 @@ def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=None):
     ])
 
     final_fit_df = X_tv_res.join(y_tv).dropna()
-    if final_fit_df.empty:
+    if check_df_empty(final_fit_df):
         print("[ERROR] Combined Train+Val residualized data empty. Cannot fit final model.")
         return best_alpha, None, common_features
 
@@ -605,7 +462,7 @@ def ridge_fixedfwd_resid_eval(
     feature_cols=FEATURE_COLS,   # raw feature cols in X_y
     label_col=LABEL_COL,
     ctrl_col=CTRL_COL,
-    peers_list=use_peers,        # peers for residualization
+    peers_list=USE_PEERS,        # peers for residualization
     train_offset=TRAIN_OFFSET,
     val_offset=VAL_OFFSET,
     test_offset=TEST_OFFSET,
@@ -635,7 +492,7 @@ def ridge_fixedfwd_resid_eval(
     print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()}   to {val_df_raw.index.max().date()}   ({len(val_df_raw)} days)")
     print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()}  to {test_df_raw.index.max().date()}  ({len(test_df_raw)} days)")
 
-    if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+    if check_df_empty(train_df_raw) or check_df_empty(val_df_raw) or check_df_empty(test_df_raw):
         raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
 
     # ---- 1) Residualization betas from TRAIN and apply to all splits ----
@@ -686,7 +543,7 @@ def ridge_fixedfwd_resid_eval(
     # ---- 3) Predict on TEST and compute PnL ----
     X_test_predict = X_test_full.reindex(columns=model_features)
     test_pred_df = X_test_predict.join(y_test.rename('y_real')).dropna()
-    if test_pred_df.empty:
+    if check_df_empty(test_pred_df):
         print("[WARN] No valid rows in TEST after NaN drop. Returning empty results.")
         return pd.DataFrame(columns=["y_hat","y_real","alpha","signal","signal_prev","cost","pnl"])
 
@@ -714,7 +571,7 @@ print("Executing Ridge (FixedFWD, Residualized Features)")
 print("="*50)
 ridge_fixedfwd_resid_df = ridge_fixedfwd_resid_eval(X_y)
 print("\n[INFO] Ridge_FixedFWD_Resid (head of results):")
-if not ridge_fixedfwd_resid_df.empty:
+if not check_df_empty(ridge_fixedfwd_resid_df):
     print(ridge_fixedfwd_resid_df.head())
 else:
     print("[INFO] No results generated.")
@@ -851,7 +708,7 @@ print(f"[INFO] Fixed Splits | Train: {train_df_raw.index.min().date()} to {train
 print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()} to {val_df_raw.index.max().date()} ({len(val_df_raw)} days)")
 print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()} to {test_df_raw.index.max().date()} ({len(test_df_raw)} days)")
 
-if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+if check_df_empty(train_df_raw) or check_df_empty(val_df_raw) or check_df_empty(test_df_raw):
     raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
 
 # --- 2. Calculate Betas ONCE on Training Data ---
@@ -863,10 +720,10 @@ def calculate_betas(train_data_raw, feature_list, ctrl_col_name, peers_list):
         for p in peers_list:
             if p in train_features_raw.columns:
                 df_tr = train_features_raw[[p, ctrl_col_name]].dropna()
-                if len(df_tr) >= 50 and df_tr[ctrl_col_name].std() > 1e-8:
+                if not check_df_empty(df_tr) and df_tr[ctrl_col_name].std().mean() > 1e-8:
                     try:
-                        lr = LinearRegression().fit(df_tr[[ctrl_col_name]], df_tr[p])
-                        betas[p] = float(lr.coef_[0])
+                        lr = LinearRegression().fit(df_tr[[ctrl_col_name]], df_tr[p]) # TODO
+                        betas[p] = float(np.ravel(lr.coef_)[0])
                     except Exception as e:
                         print(f"[WARN] Beta calc failed for {p}: {e}"); betas[p] = np.nan
                 else: betas[p] = np.nan
@@ -875,7 +732,7 @@ def calculate_betas(train_data_raw, feature_list, ctrl_col_name, peers_list):
     return betas
 
 print("[INFO] Calculating residualization betas on fixed training set...")
-betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, USE_PEERS)
 print(f"[INFO] Betas calculated: { {k: f'{v:.4f}' for k, v in betas_fixed.items()} }") # Print formatted betas
 
 # --- 3. Apply Residualization to All Fixed Sets ---
@@ -900,18 +757,18 @@ def apply_resid_slice(df_raw_slice, betas_dict, feature_list, ctrl_col_name, pee
     return df_res
 
 print("[INFO] Applying residualization to Train, Val, Test sets...")
-X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
-X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
-X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
+X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
+X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
 
 # Define final feature columns based on residualization
 final_feature_cols = []
 if CTRL_COL in FEATURE_COLS: final_feature_cols.append(CTRL_COL)
-final_feature_cols += [p + "_res" for p in use_peers]
+final_feature_cols += [p + "_res" for p in USE_PEERS]
 print(f"[INFO] Using residualized features: {final_feature_cols}")
 
 # add style features (NVDA vol/mom/liquidity) into the design matrices
-style_candidates = ['nvda_vol5', 'nvda_mom1', 'nvda_mom5', 'nvda_log_dvol']  
+style_candidates = [_col(TARGET, feat) for feat in FEATURES]
 style_cols = [c for c in style_candidates if c in FEATURE_COLS]           
 
 X_train_full = pd.concat([X_train_res[final_feature_cols], train_df_raw[style_cols]], axis=1)  
@@ -930,14 +787,17 @@ def _best_alpha_by_val_lasso_fixed(X_train_full, y_train, X_val_full, y_val, alp
     if not common_features: return 1e-3, None # Default alpha, no model
 
     # Prepare training data (drop NaNs from features/target alignment)
-    train_fit_df = X_train_full[common_features].join(y_train).dropna()
-    if train_fit_df.empty: print("[ERROR] Lasso Tuning: Training data empty after NaN drop."); return 1e-3, None
+    # We first drop all columns that are entirely NaN, then drop rows that contain NaN values.
+    train_fit_df = X_train_full[common_features].join(y_train.to_frame()).dropna(axis=1, how="all").dropna(axis=0, how="any")
+    # Have to update common features because some might have been dropped due to all NaNs
+    common_features = [feat for feat in common_features if feat in train_fit_df.columns]
+    if check_df_empty(train_fit_df): print("[ERROR] Lasso Tuning: Training data empty after NaN drop."); return 1e-3, None
     Xtr_fit = train_fit_df[common_features]
     ytr_fit = train_fit_df[LABEL_COL]
 
     # Prepare validation data similarly
     val_pred_df = X_val_full[common_features].join(y_val).dropna()
-    if val_pred_df.empty: 
+    if check_df_empty(val_pred_df): 
         print("[WARN] Lasso Tuning: Validation data empty after NaN drop.")  # Continue; result might be less reliable
         Xva_pred = pd.DataFrame(columns=common_features, index=[])
         yva_eval = pd.Series(name=LABEL_COL, dtype=float)
@@ -952,7 +812,7 @@ def _best_alpha_by_val_lasso_fixed(X_train_full, y_train, X_val_full, y_val, alp
         ])
         try:
             pipe.fit(Xtr_fit, ytr_fit)
-            if not Xva_pred.empty:  # Only calculate MSE if validation data exists
+            if not check_df_empty(Xva_pred):  # Only calculate MSE if validation data exists
                  y_pred_val = pipe.predict(Xva_pred)
                  mse = mean_squared_error(yva_eval, y_pred_val)
                  if mse < best_mse: best_mse, best_alpha = mse, a
@@ -970,7 +830,7 @@ def _best_alpha_by_val_lasso_fixed(X_train_full, y_train, X_val_full, y_val, alp
     final_pipe = Pipeline([("scaler", StandardScaler(with_mean=True, with_std=True)),
                            ("lasso",  Lasso(alpha=best_alpha, random_state=42, max_iter=2000))])
     final_fit_df = X_tv_full.join(y_tv).dropna()
-    if final_fit_df.empty: print("[ERROR] Lasso final fit data empty."); return best_alpha, None
+    if check_df_empty(final_fit_df): print("[ERROR] Lasso final fit data empty."); return best_alpha, None
     try:
         final_pipe.fit(final_fit_df[common_features], final_fit_df[LABEL_COL])
     except ValueError as e:
@@ -996,7 +856,7 @@ else:
     test_records = []
     prev_sig = 0 # Initialize prev_sig for the fixed test period
 
-    if X_test_pred.empty:
+    if check_df_empty(X_test_pred):
          print("[WARN] No valid data points in the test set after dropping NaNs.")
          wf_lasso_fixed_res = pd.DataFrame()
     else:
@@ -1007,7 +867,7 @@ else:
         # Align predictions with actuals and calculate PnL
         test_results_df = pd.DataFrame({'y_hat': y_hat_test}).join(y_test.rename('y_real')).dropna() # Ensure alignment and drop rows where y_real might be missing
 
-        if test_results_df.empty:
+        if check_df_empty(test_results_df):
              print("[WARN] No common dates between test predictions and actuals.")
              wf_lasso_fixed_res = pd.DataFrame()
         else:
@@ -1025,7 +885,7 @@ else:
 register_results("Lasso_FixedFWD_Resid", wf_lasso_fixed_res)
 
 # Print head of results
-if not wf_lasso_fixed_res.empty:
+if not check_df_empty(wf_lasso_fixed_res):
     print("\n[INFO] wf_lasso_fixed_res (head of test results):")
     print(wf_lasso_fixed_res.head())
 else:
@@ -1176,7 +1036,7 @@ if 'train_df_raw' not in locals() or 'val_df_raw' not in locals() or 'test_df_ra
      print(f"[INFO] Fixed Splits | Val  : {val_df_raw.index.min().date()} to {val_df_raw.index.max().date()} ({len(val_df_raw)} days)")
      print(f"[INFO] Fixed Splits | Test : {test_df_raw.index.min().date()} to {test_df_raw.index.max().date()} ({len(test_df_raw)} days)")
 
-     if train_df_raw.empty or val_df_raw.empty or test_df_raw.empty:
+     if check_df_empty(train_df_raw) or check_df_empty(val_df_raw) or check_df_empty(test_df_raw):
          raise ValueError("One or more fixed data splits are empty. Check offsets and data availability.")
 else:
      print("[INFO] Using existing fixed time splits.")
@@ -1185,7 +1045,7 @@ else:
 if 'betas_fixed' not in locals():
     print("[INFO] Calculating residualization betas on fixed training set for Elastic Net...")
     # Ensure calculate_betas function is defined in a previous cell
-    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, USE_PEERS)
     print(f"[INFO] Betas calculated: { {k: f'{v:.4f}' for k, v in betas_fixed.items()} }")
 else:
     print("[INFO] Using existing fixed betas.")
@@ -1227,15 +1087,17 @@ def _best_params_by_val_enet_fixed(X_train_full, y_train, X_val_full, y_val, alp
     common_features = X_train_full.columns.intersection(X_val_full.columns).tolist()
     if not common_features: return (1e-3, 0.5), None # Default params, no model
 
-    # Prepare training data
-    train_fit_df = X_train_full[common_features].join(y_train).dropna()
-    if train_fit_df.empty: print("[ERROR] ENet Tuning: Training data empty after NaN drop."); return (1e-3, 0.5), None
+    # We first drop all columns that are entirely NaN, then drop rows that contain NaN values.
+    train_fit_df = X_train_full[common_features].join(y_train.to_frame()).dropna(axis=1, how="all").dropna(axis=0, how="any")
+    # Have to update common features because some might have been dropped due to all NaNs
+    common_features = [feat for feat in common_features if feat in train_fit_df.columns]
+    if check_df_empty(train_fit_df): print("[ERROR] ENet Tuning: Training data empty after NaN drop."); return (1e-3, 0.5), None
     Xtr_fit = train_fit_df[common_features]
     ytr_fit = train_fit_df[LABEL_COL]
 
     # Prepare validation data
     val_pred_df = X_val_full[common_features].join(y_val).dropna()
-    if val_pred_df.empty:
+    if check_df_empty(val_pred_df):
         print("[WARN] ENet Tuning: Validation data empty after NaN drop.")
         Xva_pred = pd.DataFrame(columns=common_features, index=[])              
         yva_eval = pd.Series(name=LABEL_COL, dtype=float)                  
@@ -1292,7 +1154,7 @@ else:
     X_test_pred = X_test_full[model_features].dropna()                       
     test_results_df = pd.DataFrame() # Initialize empty
 
-    if X_test_pred.empty:
+    if check_df_empty(X_test_pred):
          print("[WARN] No valid data points in the test set after dropping NaNs.")
     else:
         y_hat_test_array = final_model_enet.predict(X_test_pred)
@@ -1316,7 +1178,7 @@ else:
 register_results("ENet_FixedFWD_Resid", wf_enet_fixed_res)
 
 # Print head of results
-if not wf_enet_fixed_res.empty:
+if not check_df_empty(wf_enet_fixed_res):
     print("\n[INFO] wf_enet_fixed_res (head of test results):")
     print(wf_enet_fixed_res.head())
 else:
@@ -1325,6 +1187,9 @@ print("="*50)
 
 
 # %%
+# Needed below
+adj_close = data_cube["close"]
+
 # Summarize results from the store
 print("\n" + "="*40)
 print("PERFORMANCE SUMMARY (All Models)")
@@ -1679,7 +1544,7 @@ else:
 # -----------------------------
 if 'betas_fixed' not in locals():
     print("[INFO] Calculating residualization betas on fixed TRAIN set for GARCH...")
-    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, USE_PEERS)
 else:
     print("[INFO] Using existing fixed betas.")
 
@@ -1687,15 +1552,15 @@ else:
 # Apply residualization to splits
 # -----------------------------
 print("[INFO] Applying residualization to Train / Val / Test for GARCH...")
-X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
-X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
-X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
+X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
+X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
 
 # Final residualized feature names (consistent order)
 final_feature_cols = []
 if CTRL_COL in FEATURE_COLS:
     final_feature_cols.append(CTRL_COL)
-final_feature_cols += [p + "_res" for p in use_peers]
+final_feature_cols += [p + "_res" for p in USE_PEERS]
 print(f"[INFO] Using residualized features: {final_feature_cols}")
 
 # add NVDA style features (vol/mom/liquidity) into the ARX design
@@ -2282,15 +2147,15 @@ else:
 # --- 2) Residualize peers on TRAIN and apply to all splits ---
 if 'betas_fixed' not in locals():
     print("[INFO] Calculating residualization betas (TRAIN)...")
-    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, use_peers)
+    betas_fixed = calculate_betas(train_df_raw, FEATURE_COLS, CTRL_COL, USE_PEERS)
 
-X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
-X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
-X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, use_peers)
+X_train_res = apply_resid_slice(train_df_raw, betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
+X_val_res   = apply_resid_slice(val_df_raw,   betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
+X_test_res  = apply_resid_slice(test_df_raw,  betas_fixed, FEATURE_COLS, CTRL_COL, USE_PEERS)
 
 final_feature_cols = []
 if CTRL_COL in FEATURE_COLS: final_feature_cols.append(CTRL_COL)
-final_feature_cols += [p + "_res" for p in use_peers]
+final_feature_cols += [p + "_res" for p in USE_PEERS]
 
 # --- 3) Add NVDA style features (vol/mom/liquidity) ---
 style_candidates = ['nvda_vol5','nvda_mom1','nvda_mom5','nvda_log_dvol']
@@ -2568,258 +2433,3 @@ else:
 # 6. https://www.statsmodels.org/stable/ (for VAR model)
 #
 # Also searching some Kaggle Competitions for "stock prediction" or "time series forecasting", they often use LGBM/XGBoost as usual from kaggle, so worth exploring.
-
-# %% [markdown]
-# # ARCHIVE
-
-# %%
-# # Step 5: Walk-Forward Functions
-
-# # Helper function for hyper parameter tuning the alpha on validation set
-# # Now expects residualized features as input
-# def _best_alpha_by_val(X_train_res, y_train, X_val_res, y_val, alphas=ALPHA_GRID):
-#     """
-#     Trains a separate model for each alpha ON RESIDUALIZED FEATURES, and then finds the one with the lowest MSE on the validation set. After, it refits a new model
-#     on the combined (train + validation) residualized data using that best alpha.
-#     """
-    
-#     # Initialize trackers for the best hyperparameter and its score
-#     best_alpha, best_mse = None, np.inf
-    
-#     # Determine common columns present in both train and val residualized sets
-#     common_features = X_train_res.columns.intersection(X_val_res.columns).tolist()
-#     if not common_features:
-#         print("[WARN] No common features between residualized train and validation sets.")
-#         return 1.0, None # Default alpha, no model
-
-#     # --- 1. Validation Loop: Find the best alpha ---
-#     for a in alphas:
-#         pipe = Pipeline([
-#             ("scaler", StandardScaler(with_mean=True, with_std=True)),
-#             ("ridge",  Ridge(alpha=a, random_state=42))
-#         ])
-        
-#         # Prepare training data: Use common features, join target, drop NAs
-#         train_fit_df = X_train_res[common_features].join(y_train).dropna()
-#         if train_fit_df.empty: continue
-#         Xtr_fit = train_fit_df[common_features]
-#         ytr_fit = train_fit_df[y_train.name]
-#         if Xtr_fit.empty: continue
-             
-#         try: pipe.fit(Xtr_fit, ytr_fit)
-#         except ValueError as e:
-#              print(f"[WARN] Pipe fitting failed for alpha {a}: {e}")
-#              continue
-        
-#         # Prepare validation data: Use common features, drop NAs, align target
-#         Xva_pred_ready = X_val_res[common_features].dropna()
-#         if Xva_pred_ready.empty: mse = np.inf
-#         else:
-#              yva_aligned = y_val.loc[Xva_pred_ready.index].dropna()
-#              valid_idx = Xva_pred_ready.index.intersection(yva_aligned.index)
-#              if valid_idx.empty: mse = np.inf
-#              else:
-#                   Xva_pred_final = Xva_pred_ready.loc[valid_idx]
-#                   yva_aligned_final = yva_aligned.loc[valid_idx]
-#                   if Xva_pred_final.empty: mse = np.inf
-#                   else:
-#                        y_pred_val = pipe.predict(Xva_pred_final)
-#                        mse = mean_squared_error(yva_aligned_final, y_pred_val)
-        
-#         if mse < best_mse: best_mse, best_alpha = mse, a
-    
-#     if best_alpha is None:
-#         print("[WARN] No best alpha found. Defaulting to 1.0")
-#         best_alpha = 1.0
-
-#     # --- 2. Refit on (Train + Val) using common features ---
-#     X_tv_res = pd.concat([X_train_res, X_val_res], axis=0)[common_features]
-#     y_tv = pd.concat([y_train, y_val], axis=0)
-
-#     final_pipe = Pipeline([
-#         ("scaler", StandardScaler(with_mean=True, with_std=True)),
-#         ("ridge",  Ridge(alpha=best_alpha, random_state=42))
-#     ])
-
-#     final_fit_df = X_tv_res.join(y_tv).dropna()
-#     if final_fit_df.empty:
-#          print("[ERROR] Combined Train+Val residualized data empty. Cannot fit final model.")
-#          return best_alpha, None
-         
-#     Xtv_fit = final_fit_df[common_features]
-#     ytv_fit = final_fit_df[y_tv.name]
-
-#     try: final_pipe.fit(Xtv_fit, ytv_fit)
-#     except ValueError as e:
-#         print(f"[ERROR] Final pipe fitting failed with alpha {best_alpha}: {e}")
-#         return best_alpha, None
-
-#     return best_alpha, final_pipe
-
-# # Performs a "walk-forward" or "rolling window" backtest using time offsets and row-by-row residualization
-# def walk_forward_ridge_all_features_time_resid_row(
-#     X_y: pd.DataFrame,
-#     feature_cols=FEATURE_COLS, # Raw feature cols from X_y
-#     label_col=LABEL_COL,
-#     ctrl_col=CTRL_COL,
-#     peers_list=use_peers,      # Peers for residualize_row
-#     train_offset=TRAIN_OFFSET,
-#     val_offset=VAL_OFFSET,
-#     test_offset=TEST_OFFSET,
-#     predict_step=PREDICT_STEP,
-#     alphas=ALPHA_GRID,
-#     cost_one_way=ONE_WAY
-# ):
-#     """
-#     Simulates walk-forward backtesting using time-based rolling windows. Applies residualize_row function row-by-row based on preceding training data.
-#     Predicts one day at a time within the final test period.
-#     """
-    
-#     dates = X_y.index
-#     first_train_start = dates.min()
-#     first_predict_date = first_train_start + train_offset + val_offset
-#     last_date = dates.max()
-#     test_period_start_date = last_date - test_offset + pd.Timedelta(days=1)
-    
-#     if first_predict_date > last_date:
-#         raise ValueError("Not enough data for Train + Val offset.")
-        
-#     actual_first_predict_idx = dates.searchsorted(first_predict_date)
-#     if actual_first_predict_idx >= len(dates): raise ValueError("First prediction date beyond data.")
-#     actual_first_predict_date = dates[actual_first_predict_idx]
-
-#     test_start_idx = dates.searchsorted(test_period_start_date)
-#     if test_start_idx >= len(dates):
-#         print("[WARN] Test period start beyond data. Backtest may be shorter.")
-#         test_start_idx = actual_first_predict_idx
-
-#     print(f"[INFO] Backtest run | First prediction: {actual_first_predict_date.date()} | Test start: {dates[test_start_idx].date()} | Last date: {last_date.date()}")
-
-#     records = []
-#     prev_sig = 0
-    
-#     # Define expected columns from residualize_row
-#     resid_feature_cols = []
-#     if ctrl_col in feature_cols: resid_feature_cols.append(ctrl_col)
-#     resid_feature_cols += [p + "_res" for p in peers_list]
-
-#     current_predict_idx = actual_first_predict_idx
-#     while current_predict_idx < len(dates):
-#         t = dates[current_predict_idx]
-        
-#         # --- 1. Define Window Boundaries ---
-#         val_end_date = t - pd.Timedelta(days=1)
-#         val_start_date = val_end_date - val_offset + pd.Timedelta(days=1)
-#         train_end_date = val_start_date - pd.Timedelta(days=1)
-#         train_start_date = train_end_date - train_offset + pd.Timedelta(days=1)
-#         train_start_date = max(train_start_date, first_train_start)
-#         val_start_date = max(val_start_date, first_train_start)
-
-#         # --- 2. Slice Raw Data ---
-#         hist_train_raw = X_y.loc[train_start_date : train_end_date]
-#         hist_val_raw   = X_y.loc[val_start_date : val_end_date]
-#         row_t_raw      = X_y.loc[t]
-
-#         if hist_train_raw.empty or hist_val_raw.empty:
-#             if t >= dates[test_start_idx]: records.append({"date": t, "y_hat": np.nan, "y_real": float(row_t_raw.get(label_col, np.nan)), "alpha": np.nan, "signal": 0, "signal_prev": prev_sig, "cost": 0, "pnl": 0})
-#             current_predict_idx += 1; continue
-
-#         # --- 3. Residualization using the helper function ---
-#         # Data available *before* day t for residualizing day t's features
-#         train_X_for_resid_t = X_y.loc[train_start_date : val_end_date, feature_cols] # Up to t-1
-        
-#         # Residualize test row (xt)
-#         xt_res_series = residualize_row(train_X_for_resid_t, row_t_raw[feature_cols], ctrl_col, peers_list)
-
-#         # Residualize validation set (Xva) - Apply row-wise. So for each row in validation, use data *before that row's date* for beta calculation
-#         Xva_res_list = []
-#         for val_idx, val_row in hist_val_raw.iterrows():
-#             train_X_for_resid_val = X_y.loc[train_start_date : val_idx - pd.Timedelta(days=1), feature_cols]
-#             if not train_X_for_resid_val.empty:
-#                  res_row = residualize_row(train_X_for_resid_val, val_row[feature_cols], ctrl_col, peers_list)
-#                  res_row.name = val_idx # Assign index
-#                  Xva_res_list.append(res_row)
-#         Xva_res = pd.DataFrame(Xva_res_list) if Xva_res_list else pd.DataFrame(columns=resid_feature_cols)
-
-
-#         # Residualize training set (Xtr) - Apply row-wise (computationally heavy), thus for each row in training, use data *before that row's date*
-#         # Potential optimization: Calculate betas once on hist_train_raw and apply. Let's stick to the definition for now, but comment on potential slowness in report.
-#         Xtr_res_list = []
-#         for train_idx, train_row in hist_train_raw.iterrows():
-#              # Data strictly before the current training row's date
-#              train_X_for_resid_train = X_y.loc[train_start_date : train_idx - pd.Timedelta(days=1), feature_cols]
-#              if not train_X_for_resid_train.empty:
-#                   res_row = residualize_row(train_X_for_resid_train, train_row[feature_cols], ctrl_col, peers_list)
-#                   res_row.name = train_idx
-#                   Xtr_res_list.append(res_row)
-#         Xtr_res = pd.DataFrame(Xtr_res_list) if Xtr_res_list else pd.DataFrame(columns=resid_feature_cols)
-
-#         # Get corresponding labels
-#         ytr = hist_train_raw[label_col]
-#         yva = hist_val_raw[label_col]
-#         y_real = float(row_t_raw[label_col])
-
-#         # --- 4. Find Best Alpha and Refit Model ---
-#         best_alpha, final_model = _best_alpha_by_val(Xtr_res, ytr, Xva_res, yva, alphas=alphas)
-
-#         if final_model is None:
-#             print(f"[WARN] Model fitting failed for {t.date()}. Skipping.")
-#             if t >= dates[test_start_idx]: records.append({"date": t, "y_hat": np.nan, "y_real": y_real, "alpha": best_alpha, "signal": 0, "signal_prev": prev_sig, "cost": 0, "pnl": 0})
-#             current_predict_idx += 1; continue
-
-#         # --- 5. Predict for Day 't' ---
-#         # Ensure xt_res_series is aligned with features expected by the model
-#         model_features = final_model.feature_names_in_
-#         xt_res_series_aligned = xt_res_series.reindex(model_features)
-#         xt_res_df = pd.DataFrame([xt_res_series_aligned.values], index=[t], columns=model_features) # Select and order
-
-#         if xt_res_df.isnull().any().any():
-#              y_hat = np.nan; sig = 0
-#         else:
-#              try:
-#                  y_hat = float(final_model.predict(xt_res_df)[0])
-#                  sig = 1 if y_hat > 0 else (-1 if y_hat < 0 else 0)
-#              except Exception as e:
-#                  print(f"[ERROR] Prediction failed at {t.date()}: {e}"); y_hat = np.nan; sig = 0
-
-#         # --- 6. Calculate PnL ---
-#         if pd.isna(y_real):
-#              pnl = np.nan; trade_cost = np.nan
-#              legs = abs(sig - prev_sig)
-#              trade_cost = legs * cost_one_way # Cost might still occur
-#         else:
-#              legs = abs(sig - prev_sig)
-#              gross_pnl = sig * y_real
-#              trade_cost = legs * cost_one_way
-#              pnl = gross_pnl - trade_cost
-
-#         # --- 7. Record Results (Only for the final test period) ---
-#         if t >= dates[test_start_idx]:
-#             records.append({
-#                 "date": t, "y_hat": y_hat, "y_real": y_real, "alpha": best_alpha,
-#                 "signal": sig, "signal_prev": prev_sig, "cost": trade_cost, "pnl": pnl
-#             })
-            
-#         prev_sig = sig
-#         current_predict_idx += 1
-
-#     # --- End of Loop ---
-#     print("[INFO] ...Backtest complete.")
-#     wf = pd.DataFrame.from_records(records)
-#     if not wf.empty: wf = wf.set_index("date").sort_index()
-#     return wf
-
-# # Execute the time-based walk-forward backtest using row-by-row residualization
-# print("\n" + "="*50)
-# print("Executing Time-Based Rolling Window Backtest with Row-by-Row Residualization")
-# print("="*50)
-# wf_ridge_all_time_res_row = walk_forward_ridge_all_features_time_resid_row(X_y)
-# print("\n[INFO] wf_ridge_all_time_res_row (head of results):")
-# if not wf_ridge_all_time_res_row.empty:
-#     print(wf_ridge_all_time_res_row.head())
-# else:
-#     print("[INFO] No results generated.")
-# print("="*50)
-
-# # Register the results
-# register_results("Ridge_TimeRoll_ResidRow", wf_ridge_all_time_res_row)
