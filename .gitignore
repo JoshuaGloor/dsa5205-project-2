@@ -1,6 +1,10 @@
 # Ignore all Jupyter notebook files (we track only the Jupytext versions)
 *.ipynb
 
+# Python cache and byte code
+**/__pychache__/
+**/*.pyc
+
 # Jupyter
 .ipynb_checkpoints/*
 .jupyter_ystore.db
