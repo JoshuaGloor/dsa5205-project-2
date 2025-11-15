@@ -7,9 +7,9 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.18.1
 #   kernelspec:
-#     display_name: base
+#     display_name: Python (p2)
 #     language: python
-#     name: python3
+#     name: p2
 # ---
 
 # %% [markdown]
@@ -1075,6 +1075,10 @@ else:
     print("[INFO] No results generated for Lasso Fixed FWD.")
 print("="*50)
 
+
+# %%
+# Needed below
+adj_close = data_cube["close"]
 
 # %%
 # Step 6: Evaluation (Using the results registry functions), and plotting results
