@@ -7,44 +7,40 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.18.1
 #   kernelspec:
-#     display_name: base
+#     display_name: Python (p2)
 #     language: python
-#     name: python3
+#     name: p2
 # ---
 
 # %% [markdown]
 # # Introduction
-# ## Feature Stocks:
-# MSFT, GOOGL, AMZN, ORCL:
-# https://investor.nvidia.com/news/press-release-details/2023/NVIDIA-Introduces-Generative-AI-Foundry-Service-on-Microsoft-Azure-for-Enterprises-and-Startups-Worldwide/default.aspx
+# We build and evaluate a systematic strategy to forecast NVDA’s overnight (close-to-open) returns using only information available at the prior US market close. The feature set captures market, sector, and peer-company signals, with economically motivated design choices and strict controls against data leakage. Using data from July 2023 to June 2025, we compare regularized linear baselines and non-linear models under a clear train/holdout split. Forecasts are translated into trading positions and evaluated out-of-sample against investable benchmarks, including buy-and-hold NVDA and the SOXX sector ETF.
 #
-# SNOW, NOW, SAP, ADBE:
-# https://www.businesswire.com/news/home/20240318504019/en/Snowflake-Teams-with-NVIDIA-to-Deliver-Full-Stack-AI-Platform-for-Customers-to-Transform-Their-Industries
+# # Featured Stocks
+#
+# To motivate the peer universe, we also provide some brief references to recent news highlighting economic links between NVIDIA and several related companies, illustrating why some tickers are included in the feature set.
+#
+# AMD, AVGO, GOOGL, MSFT, ORCL, TSM:
+# [How Sam Altman Tied Tech’s Biggest Players to OpenAI](https://www.wsj.com/tech/ai/sam-altman-open-ai-nvidia-deals-d10a6525)
+#
+# ADBE, NOW, SAP, SNOW:
+# [Snowflake Teams with NVIDIA to Deliver Full-Stack AI Platform for Customers to Transform Their Industries](https://www.businesswire.com/news/home/20240318504019/en/Snowflake-Teams-with-NVIDIA-to-Deliver-Full-Stack-AI-Platform-for-Customers-to-Transform-Their-Industries)
 #
 # DELL, HPE, SMCI:
-# https://www.dell.com/en-us/dt/corporate/newsroom/announcements/detailpage.press-releases~usa~2024~05~20240520-dell-technologies-expands-dell-ai-factory-with-nvidia-to-turbocharge-ai-adoption.htm#/filter-on/Country:en-us
+# [Dell Technologies Expands Dell AI Factory with NVIDIA to Turbocharge AI Adoption](https://www.dell.com/en-us/dt/corporate/newsroom/announcements/detailpage.press-releases~usa~2024~05~20240520-dell-technologies-expands-dell-ai-factory-with-nvidia-to-turbocharge-ai-adoption.htm#/filter-on/Country:en-us)
 #
-# Others (competitors or suppliers): AMD, INTC, AVGO, TSM, ASML, AMAT, KLAC, LRCX, MU
+# INTC:
+# [Investors Love Intel Again. That Still Doesn’t Solve Its Problems.](https://www.wsj.com/tech/investors-love-intel-again-that-still-doesnt-solve-its-problems-00d2dc0d)
 #
+# AMZN:
+# [OpenAI, Amazon Sign $38 Billion Cloud Deal](https://www.wsj.com/tech/ai/openai-amazon-sign-38-billion-cloud-deal-89ff8650)
 #
-# ## Target Variable / asset:
-# We will be tracking the % change in NVIDIA share price movement, and thus the aim is to long or short the NVDA shares.
-# Frequency of predictions will be daily, as our goal is to take advantage of the rapid movements in AI-tech firm to predict NVDA movements at t+1.   
+# NOK:
+# [Nvidia to invest $1bn in Nokia as chip giant extends deal spree](https://on.ft.com/47MfGjm)
 #
-# ## Control / Benchmark:
-# We need an appropriate benchmark to trace when the broad market / sector moves so that any predictive signal from peers and the model isn’t just the market movements. An appropriate index we can use as a benchmark are SOXX (semi-conductor ETF which is invested in many companies listed as feature stocks such as AVGO, NVDA, AMD, and more) for industry movements, or SPY for overall market movements.
-# Implementation idea (for later): for each peer, regress its return on SOXX and use the residual as the feature (i.e., peer move beyond the sector). This isolates idiosyncratic spillovers into NVDA instead of generic semi beta.
+# We further include a supplementary set of peer tickers chosen for economic relevance; we do not individually justify these selections.
 #
-# ## Currency
-# Will need to double check all the feature stocks, but they should all be in some US stock exchange (NYSE or NASDAQ). So we shouldn't have to deal with any foreign exchanage rates, and deal only with USD.
-#
-# ## Frequency:
-# As we are trying to capitalize on the rapid movements of we will choose daily
-#
-# ## Decision time:
-# We need to define the decision time (the timestamp when we form our signal using only information available by then, and lock in the trade we’ll place). I'm just going to set the decision time at U.S. cash close (at time t, ~16:00 New York), and execution time at next open (t+1).
-#
-# This allows the label choices to then align naturally, predicting at close for --> next-open. This avoids look-ahead, is easy to explain, and matches data availability (daily movements)
+# AAPL, AKAM, AMAT, ANET, ASML, CAT, CRM, CSCO, DASTY, HNHPF, ILMN, IQV, JNJ, KLAC, LCID, LI, LLY, LNVGY, LOW, LRCX, MBGYY, META, MU, NIO, PLTR, RXRX, SIEGY, SOUN, STLA, T, TMUS, UBER, XPEV
 
 # %%
 import pandas as pd
@@ -74,7 +70,28 @@ START = "2023-07-01"
 END = "2025-06-30"
 
 TARGET = "NVDA"
-PEERS = ['INTC', 'TSM', 'MU', 'AMAT', 'KLAC', 'LRCX', 'SMCI', 'ASML', 'MBGYY', 'NOW', 'LI', 'NOK', 'HNHPF', 'IQV', 'TMUS', 'LCID', 'AKAM', 'SOUN', 'JNJ']
+PEERS = [
+    # Cloud / AI infra
+    "MSFT","GOOGL","AMZN","ORCL","AKAM","META","AAPL",
+    # Telco
+    "NOK","TMUS","T",
+    # Auto / AV (US-traded lines incl. OTC ADRs)
+    "UBER","STLA","LCID","MBGYY","LI","XPEV","NIO",
+    # Hardware / systems
+    "DELL","HPE","CSCO","SMCI","LNVGY",
+    # Healthcare
+    "JNJ","LLY","ILMN","IQV",
+    # Software / manufacturing / twins adjacents
+    "PLTR","LOW","SIEGY","TSM","HNHPF","CAT","DASTY",
+    # Enterprise software
+    "SNOW","NOW","SAP","ADBE","CRM","ANET",
+    # Semis & equipment
+    "AVGO","ASML","AMAT","KLAC","LRCX","MU",
+    # Competitors
+    "AMD","INTC",
+    # NVDA direct investments
+    "RXRX","SOUN"
+]
 
 CTRL_TICKER = "SOXX"
 
@@ -2412,24 +2429,3 @@ if not metrics_df.empty:
 else:
     print("[INFO] No metrics computed; check results_store.")
 
-
-# %% [markdown]
-# ## Other Notes
-
-# %% [markdown]
-# #### Potential models:
-# 1. Some kind of random forest regressor / tree basd ensemble like XGBoost or LightGBM
-# 2. Probbly good to also implement some kind of SVR based on Profs notes, or convert to a classification approach (up or down) and implement SVMs and Logistic Regression
-
-# %% [markdown]
-# ### References
-
-# %% [markdown]
-# 1. Kelly, B. T., Malamud, S., & Zhou, K. (2024). The virtue of complexity in return prediction
-# 2. Chinco, A. M., Clark-Joseph, A. D., & Ye, M. (2019). Sparse signals in the cross‐section of returns.
-# 3. https://medium.com/@shruti.dhumne/elastic-net-regression-detailed-guide-99dce30b8e6e
-# 4. https://medium.com/@adamhassouni111/a-comprehensive-guide-to-implementing-arima-garch-for-trading-strategies-60a48ac3f08f
-# 5. https://www.kaggle.com/code/achrafbenssassi/advanced-trading-strategy-using-garch-model-and-bb
-# 6. https://www.statsmodels.org/stable/ (for VAR model)
-#
-# Also searching some Kaggle Competitions for "stock prediction" or "time series forecasting", they often use LGBM/XGBoost as usual from kaggle, so worth exploring.
