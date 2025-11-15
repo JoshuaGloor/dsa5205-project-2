@@ -74,7 +74,26 @@ START = "2023-07-01"
 END = "2025-06-30"
 
 TARGET = "NVDA"
-PEERS = ['INTC', 'TSM', 'MU', 'AMAT', 'KLAC', 'LRCX', 'SMCI', 'ASML', 'MBGYY', 'NOW', 'LI', 'NOK', 'HNHPF', 'IQV', 'TMUS', 'LCID', 'AKAM', 'SOUN', 'JNJ']
+PEERS = [    # Cloud / AI infra
+    "MSFT","GOOGL","AMZN","ORCL","AKAM","META","AAPL",
+    # Telco
+    "TMUS","T","NOK",
+    # Auto / AV (US-traded lines incl. OTC ADRs)
+    "UBER","STLA","LCID","MBGYY","LI","XPEV","NIO",
+    # Hardware / systems
+    "DELL","HPE","CSCO","SMCI","LNVGY",
+    # Healthcare
+    "JNJ","LLY","ILMN","IQV",
+    # Software / manufacturing / twins adjacents
+    "PLTR","LOW","SIEGY","TSM","HNHPF","CAT","DASTY",
+    # Enterprise software
+    "SNOW","NOW","SAP","ADBE","CRM","ANET",
+    # Semis & equipment
+    "AVGO","ASML","AMAT","KLAC","LRCX","MU",
+    # Competitors
+    "AMD","INTC",
+    # NVDA direct investments
+    "RXRX","SOUN"]
 
 CTRL_TICKER = "SOXX"
 
@@ -739,18 +758,13 @@ else:
 
 
 # %% [markdown]
-# In evaluating the performance of our daily trading strategies, we utilize specific Buy-and-Hold (BH) benchmarks designed to directly correspond to the strategies' intended holding periods, rather than a simple long-term investment "buy and hold forever" approach. This decision allows for a fairer assessment of the timing value added by the models, instead of comparing it to some investment. 
-#
-# The benchmarks used are: BH NVDA CO (Close-to-Open), which represents the return achieved by passively buying NVDA stock at the market close each day and selling it at the market open the following day, aligning with strategies targeting overnight movements, and BH NVDA CC (Close-to-Close), representing the standard daily return from holding NVDA from one day's close to the next, used for comparing strategies that target full-day returns. By comparing our strategies against these interval-specific benchmarks, we can better isolate whether our models' signals generated alpha beyond simply holding the asset during the targeted trading windows.
-
-# %% [markdown]
 # ### Lasso Models (also could do  Elastic net (Combines Lasso and Ridge) later if needed)
 
 # %%
 # Hyperparameter grids
 ALPHA_GRID_RIDGE = np.logspace(-4, 2, 13) # Alpha for Ridge
-ALPHA_GRID_LASSO = np.logspace(-5, 1, 13) # Alpha for Lasso (typically needs smaller values)
-ALPHA_GRID_ENET = np.logspace(-5, 1, 13) # Alpha for ElasticNet
+ALPHA_GRID_LASSO = np.logspace(-5, -1, 13) # Alpha for Lasso (typically needs smaller values)
+ALPHA_GRID_ENET = np.logspace(-5, -1, 13) # Alpha for ElasticNet
 L1_RATIO_GRID_ENET = [0.1, 0.3, 0.5, 0.7, 0.9, 0.99] # L1 ratio for ElasticNet
 
 # %%
@@ -1820,6 +1834,27 @@ else:
 # ### Model 3: GARCH(1,1) Regression
 
 # %%
+# -----------------------------
+# Manual fallback feature list for GARCH (when no LASSO selection), using XGBoost
+# -----------------------------
+GARCH_FALLBACK_FEATURES = [
+    'ADBE_mom5', 'AMAT_log_return_res', 'AMD_log_dvol', 'ANET_log_dvol',
+    'ASML_mom1', 'CAT_log_dvol', 'CAT_log_return_res', 'CAT_mom1',
+    'CAT_mom5', 'CRM_log_return_res', 'CSCO_mom1', 'DASTY_log_dvol',
+    'DASTY_mom5', 'GOOGL_log_dvol', 'GOOGL_mom1', 'HNHPF_log_dvol',
+    'HPE_log_return_res', 'ILMN_log_dvol', 'ILMN_log_return_res',
+    'ILMN_mom1', 'ILMN_vol5', 'INTC_mom5', 'JNJ_log_dvol',
+    'LCID_log_dvol', 'LCID_mom5', 'LCID_vol5', 'LNVGY_log_dvol',
+    'LNVGY_log_return_res', 'LOW_mom5', 'MBGYY_log_dvol',
+    'MBGYY_log_return_res', 'META_log_dvol', 'NIO_log_dvol',
+    'NIO_mom1', 'NOW_log_dvol', 'NVDA_log_dvol', 'NVDA_mom1',
+    'PLTR_vol5', 'SAP_mom5', 'SIEGY_log_dvol', 'SIEGY_mom1',
+    'SIEGY_mom5', 'SNOW_mom5', 'SOUN_vol5', 'STLA_mom1',
+    'STLA_vol5', 'TMUS_log_return_res', 'TSM_mom1', 'TSM_vol5',
+    'T_log_dvol', 'T_log_return_res', 'T_mom1', 'UBER_mom1',
+]
+
+# %%
 # ================================
 # ARX-GARCH with SIMPLE VALIDATION
 # ================================
@@ -1947,20 +1982,31 @@ elif 'LASSO_SELECTED_FEATURES' in locals() and isinstance(LASSO_SELECTED_FEATURE
     _selected = set(LASSO_SELECTED_FEATURES)
 
 if _selected is not None:
+    # Use LASSO-selected features (intersection with what exists in X_train_full)
     keep_from_lasso = [c for c in X_train_full.columns if c in _selected]
     if not keep_from_lasso:
         print("[WARN] LASSO selection produced no overlapping columns; "
+              "falling back to manual GARCH_FALLBACK_FEATURES list.")
+        keep_from_lasso = [c for c in X_train_full.columns if c in GARCH_FALLBACK_FEATURES]
+        if not keep_from_lasso:
+            print("[WARN] Manual GARCH_FALLBACK_FEATURES had no overlap; "
+                  "falling back to all residualized + style features.")
+            keep_from_lasso = X_train_full.columns.tolist()
+else:
+    # No LASSO-selected list -> use your hard-coded feature list as fallback
+    print("[WARN] No LASSO-selected feature list found; "
+          "using manual GARCH_FALLBACK_FEATURES intersection.")
+    keep_from_lasso = [c for c in X_train_full.columns if c in GARCH_FALLBACK_FEATURES]
+    if not keep_from_lasso:
+        print("[WARN] Manual GARCH_FALLBACK_FEATURES had no overlap; "
               "falling back to all residualized + style features.")
         keep_from_lasso = X_train_full.columns.tolist()
-else:
-    print("[WARN] No LASSO-selected feature list found; using all residualized + style features.")
-    keep_from_lasso = X_train_full.columns.tolist()
 
 X_train_full = X_train_full[keep_from_lasso]
 X_val_full   = X_val_full.reindex(columns=keep_from_lasso)
 X_test_full  = X_test_full.reindex(columns=keep_from_lasso)
 
-print(f"[INFO] Features after LASSO selection filter "
+print(f"[INFO] Features after LASSO/manual selection filter "
       f"({len(keep_from_lasso)}): {keep_from_lasso}")
 
 # -----------------------------
@@ -2733,7 +2779,7 @@ except Exception as e:
     raise ImportError(f"XGBoost is required: {e}")
 
 # ---- Your final chosen features (from RV screen) ----
-SELECTED_XGB_FEATURES = ['AKAM_log_dvol', 'AKAM_mom5', 'ASML_mom1', 'JNJ_mom5', 'LCID_log_dvol', 'LCID_vol5', 'MBGYY_log_return_res', 'NOW_log_dvol', 'NVDA_mom1', 'SOUN_vol5', 'TSM_mom1']
+SELECTED_XGB_FEATURES = ['ADBE_mom5', 'AMAT_log_return_res', 'AMD_log_dvol', 'ANET_log_dvol', 'ASML_mom1', 'CAT_log_dvol', 'CAT_log_return_res', 'CAT_mom1', 'CAT_mom5', 'CRM_log_return_res', 'CSCO_mom1', 'DASTY_log_dvol', 'DASTY_mom5', 'GOOGL_log_dvol', 'GOOGL_mom1', 'HNHPF_log_dvol', 'HPE_log_return_res', 'ILMN_log_dvol', 'ILMN_log_return_res', 'ILMN_mom1', 'ILMN_vol5', 'INTC_mom5', 'JNJ_log_dvol', 'LCID_log_dvol', 'LCID_mom5', 'LCID_vol5', 'LNVGY_log_dvol', 'LNVGY_log_return_res', 'LOW_mom5', 'MBGYY_log_dvol', 'MBGYY_log_return_res', 'META_log_dvol', 'NIO_log_dvol', 'NIO_mom1', 'NOW_log_dvol', 'NVDA_log_dvol', 'NVDA_mom1', 'PLTR_vol5', 'SAP_mom5', 'SIEGY_log_dvol', 'SIEGY_mom1', 'SIEGY_mom5', 'SNOW_mom5', 'SOUN_vol5', 'STLA_mom1', 'STLA_vol5', 'TMUS_log_return_res', 'TSM_mom1', 'TSM_vol5', 'T_log_dvol', 'T_log_return_res', 'T_mom1', 'UBER_mom1']
 
 # -----------------------------
 # 1) Fixed Train/Val/Test splits
@@ -3034,6 +3080,11 @@ if results_store:
 else:
     print("[INFO] results_store is empty. Nothing to plot.")
 
+
+# %% [markdown]
+# In evaluating the performance of our daily trading strategies, we utilize specific Buy-and-Hold (BH) benchmarks designed to directly correspond to the strategies' intended holding periods, rather than a simple long-term investment "buy and hold forever" approach. This decision allows for a fairer assessment of the timing value added by the models, instead of comparing it to some investment. 
+#
+# The benchmarks used are: BH NVDA CO (Close-to-Open), which represents the return achieved by passively buying NVDA stock at the market close each day and selling it at the market open the following day, aligning with strategies targeting overnight movements, and BH NVDA CC (Close-to-Close), representing the standard daily return from holding NVDA from one day's close to the next, used for comparing strategies that target full-day returns. By comparing our strategies against these interval-specific benchmarks, we can better isolate whether our models' signals generated alpha beyond simply holding the asset during the targeted trading windows.
 
 # %% [markdown]
 # ## Other Notes
